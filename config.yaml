@@ -1,0 +1,7 @@
+dataset:
+  train: 
+    path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/train"
+    seq_len: 5
+  test:
+    path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test"
+    seq_len: 5
