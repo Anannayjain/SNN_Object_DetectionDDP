@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import random
 import numpy as np
+from torch.utils.data import Subset
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
 
 # --- Import your custom modules ---
 from model import YOLOTemporalUNet
@@ -114,8 +117,23 @@ if __name__ == "__main__":
     
     # --- Data Loading ---
     print("Loading datasets...")
-    train_dataset = DSECDataset(config, mode="train")
-    val_dataset = DSECDataset(config, mode="val")
+    full_train_dataset = DSECDataset(config, mode="train")
+
+    # Group indices by sequence
+    seq_groups = defaultdict(list)
+    for idx, (img_dir, _, _) in enumerate(full_train_dataset.samples):
+        seq_groups[str(img_dir)].append(idx)
+
+    # Split and build indices efficiently
+    train_seqs, val_seqs = train_test_split(list(seq_groups), test_size=0.2, random_state=42)
+    train_seqs, val_seqs = set(train_seqs), set(val_seqs)  # O(1) lookup
+
+    train_indices, val_indices = [], []
+    for seq, indices in seq_groups.items():
+        (train_indices if seq in train_seqs else val_indices).extend(indices)
+
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_train_dataset, val_indices)
     
     train_loader = DataLoader(
         train_dataset,

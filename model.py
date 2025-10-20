@@ -155,10 +155,19 @@ class YOLOTemporalUNet(nn.Module):
         self.temporal_unet = TemporalUNet(feature_channels=feature_channels, 
                                          use_conv_lstm=use_conv_lstm)
         
+        # Load YOLO and extract its detection head
+        yolo = YOLO(yolo_model_name)
+        self.detect_head = yolo.model.model[-1]  # The Detect module
+        
+        # Ensure the detect head expects the right number of channels
+        # self.proj_p3 = nn.Conv2d(feature_channels[0], self.detect_head.ch[0], 1)
+        # self.proj_p4 = nn.Conv2d(feature_channels[1], self.detect_head.ch[1], 1)
+        # self.proj_p5 = nn.Conv2d(feature_channels[2], self.detect_head.ch[2], 1)
+
         # Detection heads for each scale
-        self.head_p3 = nn.Conv2d(feature_channels[0], num_classes + 5, kernel_size=1)
-        self.head_p4 = nn.Conv2d(feature_channels[1], num_classes + 5, kernel_size=1)
-        self.head_p5 = nn.Conv2d(feature_channels[2], num_classes + 5, kernel_size=1)
+        # self.head_p3 = nn.Conv2d(feature_channels[0], num_classes + 5, kernel_size=1)
+        # self.head_p4 = nn.Conv2d(feature_channels[1], num_classes + 5, kernel_size=1)
+        # self.head_p5 = nn.Conv2d(feature_channels[2], num_classes + 5, kernel_size=1)
 
     def forward(self, x, hidden_state=None):
         """
@@ -174,11 +183,20 @@ class YOLOTemporalUNet(nn.Module):
         temporal_features, new_hidden = self.temporal_unet(yolo_features, hidden_state)
         
         out_p3, out_p4, out_p5 = temporal_features
-        det_p3 = self.head_p3(out_p3)
-        det_p4 = self.head_p4(out_p4)
-        det_p5 = self.head_p5(out_p5)
+
+        # print("hh", out_p3.shape, out_p4.shape, out_p5.shape)
+        # Project temporal features to match YOLO head input channels
+        # out_p3 = self.proj_p3(temporal_features[0])
+        # out_p4 = self.proj_p4(temporal_features[1])
+        # out_p5 = self.proj_p5(temporal_features[2])
+
+        # detections = self.detect_head([out_p3, out_p4, out_p5])
+
+        # det_p3 = self.head_p3(out_p3)
+        # det_p4 = self.head_p4(out_p4)
+        # det_p5 = self.head_p5(out_p5)
         
-        return (det_p3, det_p4, det_p5), new_hidden
+        return detections, new_hidden
 
 # --- Example Usage ---
 if __name__ == '__main__':

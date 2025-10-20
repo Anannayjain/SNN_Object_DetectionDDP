@@ -1,0 +1,15 @@
+2025-10-20 10:40:11,836 [INFO] ================================================================================
+2025-10-20 10:40:11,836 [INFO] Training started by: Resnick28
+2025-10-20 10:40:11,836 [INFO] Training start time: 2025-10-20 05:06:44 UTC
+2025-10-20 10:40:11,836 [INFO] Using device: cuda
+2025-10-20 10:40:11,911 [INFO] GPU: NVIDIA RTX A6000
+2025-10-20 10:40:11,917 [INFO] CUDA version: 12.4
+2025-10-20 10:40:11,917 [INFO] GPU memory: 50.93 GB
+2025-10-20 10:40:11,917 [INFO] ================================================================================
+2025-10-20 10:40:11,917 [INFO] Loading datasets...
+2025-10-20 10:40:13,643 [INFO] Training samples: 49887
+2025-10-20 10:40:13,643 [INFO] Validation samples: 13164
+2025-10-20 10:40:13,644 [INFO] Initializing model...
+2025-10-20 10:40:15,948 [INFO] Total parameters: 147,181,973
+2025-10-20 10:40:15,948 [INFO] Trainable parameters: 127,067,285
+2025-10-20 10:40:15,948 [INFO] Initializing loss function...

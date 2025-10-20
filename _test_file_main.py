@@ -3,482 +3,592 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
-from pathlib import Path
 import yaml
-import numpy as np
 from tqdm import tqdm
+import os
+from pathlib import Path
+import random
+import numpy as np
 import logging
 from datetime import datetime
-import os
+from torch.utils.data import Subset
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
 
-# Assuming your model and dataset are in separate files
+# --- Import your custom modules ---
 from model import YOLOTemporalUNet
 from dataset import DSECDataset
 
-class YOLOLoss(nn.Module):
+from ultralytics.utils.loss import v8DetectionLoss
+from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
+from ultralytics.utils import ops
+
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def setup_logging(save_dir):
+    """Setup logging configuration."""
+    log_file = save_dir / f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    # Create logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # Create handlers
+    file_handler = logging.FileHandler(log_file)
+    console_handler = logging.StreamHandler()
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+class YOLOLossWrapper(nn.Module):
     """
-    Custom YOLO-style loss function for multi-scale detection.
-    Combines classification, objectness, and bounding box regression losses.
+    Wrapper for v8DetectionLoss to work with custom models.
+    Creates a mock model object with required attributes.
     """
-    def __init__(self, num_classes=2, lambda_coord=5.0, lambda_noobj=0.5):
-        super(YOLOLoss, self).__init__()
+    def __init__(self, model, num_classes=2):
+        super().__init__()
+        self.model = model
         self.num_classes = num_classes
-        self.lambda_coord = lambda_coord
-        self.lambda_noobj = lambda_noobj
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
-        self.mse_loss = nn.MSELoss(reduction='none')
         
-    def forward(self, predictions, targets, feature_sizes):
+        # Create a namespace object to hold YOLO args
+        class Args:
+            def __init__(self):
+                self.box = 7.5
+                self.cls = 0.5
+                self.dfl = 1.5
+                self.pose = 12.0
+                self.kobj = 2.0
+                self.nbs = 64
+        
+        # Add required attributes for v8DetectionLoss
+        self.args = Args()
+        self.nc = num_classes
+        self.reg_max = 16
+        self.stride = torch.tensor([8, 16, 32])  # P3, P4, P5 strides
+        self.device = next(model.parameters()).device
+        
+        # Initialize the actual loss
+        self.loss_fn = v8DetectionLoss(self)
+        
+    def forward(self, preds, batch):
         """
         Args:
-            predictions: Tuple of (det_p3, det_p4, det_p5) each of shape (B, num_classes+5, H, W)
-            targets: List of target tensors for each image in batch, shape (num_boxes, 5)
-                     Format: [class_id, x_center, y_center, width, height] (normalized 0-1)
-            feature_sizes: List of (H, W) tuples for each prediction scale
+            preds: Tuple of (det_p3, det_p4, det_p5)
+            batch: Dictionary with 'cls', 'bboxes', 'batch_idx'
         """
-        total_loss = 0.0
-        batch_size = predictions[0].shape[0]
-        device = predictions[0].device
+        return self.loss_fn(preds, batch)
+
+def format_batch_for_loss(labels_list, device):
+    """
+    Format labels for Ultralytics loss function.
+    
+    Args:
+        labels_list: List of label tensors, each of shape (N, 5) [class_id, x, y, w, h]
+        device: torch device
         
-        loss_dict = {
-            'bbox_loss': 0.0,
-            'obj_loss': 0.0,
-            'cls_loss': 0.0,
-            'total_loss': 0.0
+    Returns:
+        Dictionary with 'cls', 'bboxes', 'batch_idx' formatted for loss function
+    """
+    all_cls = []
+    all_bboxes = []
+    all_batch_idx = []
+    
+    for batch_idx, labels in enumerate(labels_list):
+        if labels.shape[0] == 0:  # No objects
+            continue
+        
+        num_objects = labels.shape[0]
+        
+        # Extract class IDs and bounding boxes
+        cls = labels[:, 0:1]  # (N, 1)
+        bboxes = labels[:, 1:5]  # (N, 4) [x, y, w, h]
+        
+        # Create batch indices
+        batch_indices = torch.full((num_objects, 1), batch_idx, 
+                                   dtype=torch.float32, device=device)
+        
+        all_cls.append(cls)
+        all_bboxes.append(bboxes)
+        all_batch_idx.append(batch_indices)
+    
+    # Concatenate all
+    if len(all_cls) == 0:
+        # No labels in entire batch
+        return {
+            'cls': torch.zeros((0, 1), device=device),
+            'bboxes': torch.zeros((0, 4), device=device),
+            'batch_idx': torch.zeros((0, 1), device=device)
         }
-        
-        for scale_idx, (pred, (feat_h, feat_w)) in enumerate(zip(predictions, feature_sizes)):
-            # Reshape: (B, num_classes+5, H, W) -> (B, H, W, num_classes+5)
-            pred = pred.permute(0, 2, 3, 1).contiguous()
-            
-            # Split predictions
-            pred_boxes = pred[..., :4]  # (B, H, W, 4)
-            pred_obj = pred[..., 4:5]   # (B, H, W, 1)
-            pred_cls = pred[..., 5:]    # (B, H, W, num_classes)
-            
-            # Build target tensors
-            for batch_idx in range(batch_size):
-                if len(targets) <= batch_idx or targets[batch_idx].shape[0] == 0:
-                    # No objects - only penalize objectness
-                    obj_mask = torch.zeros_like(pred_obj[batch_idx])
-                    loss_dict['obj_loss'] += self.lambda_noobj * self.bce_loss(
-                        pred_obj[batch_idx], obj_mask
-                    ).mean()
-                    continue
-                
-                target = targets[batch_idx]
-                
-                # Create target maps
-                obj_mask = torch.zeros((feat_h, feat_w, 1), device=device)
-                noobj_mask = torch.ones((feat_h, feat_w, 1), device=device)
-                target_boxes = torch.zeros((feat_h, feat_w, 4), device=device)
-                target_cls = torch.zeros((feat_h, feat_w, self.num_classes), device=device)
-                
-                # Assign targets to grid cells
-                for box in target:
-                    cls_id = int(box[0].item())
-                    x_center, y_center, width, height = box[1:5]
-                    
-                    # Convert to grid coordinates
-                    grid_x = int(x_center * feat_w)
-                    grid_y = int(y_center * feat_h)
-                    
-                    # Clamp to valid range
-                    grid_x = min(max(grid_x, 0), feat_w - 1)
-                    grid_y = min(max(grid_y, 0), feat_h - 1)
-                    
-                    # Assign target
-                    obj_mask[grid_y, grid_x, 0] = 1.0
-                    noobj_mask[grid_y, grid_x, 0] = 0.0
-                    target_boxes[grid_y, grid_x] = torch.tensor(
-                        [x_center, y_center, width, height], device=device
-                    )
-                    if cls_id < self.num_classes:
-                        target_cls[grid_y, grid_x, cls_id] = 1.0
-                
-                # Calculate losses for this batch item
-                obj_mask_bool = obj_mask.squeeze(-1) > 0.5
-                
-                # Bbox loss (only for cells with objects)
-                if obj_mask_bool.any():
-                    pred_boxes_obj = pred_boxes[batch_idx][obj_mask_bool]
-                    target_boxes_obj = target_boxes[obj_mask_bool]
-                    
-                    # Use MSE for bbox coordinates and size
-                    bbox_loss = self.mse_loss(pred_boxes_obj, target_boxes_obj).sum()
-                    loss_dict['bbox_loss'] += self.lambda_coord * bbox_loss
-                
-                # Objectness loss
-                obj_loss = self.bce_loss(pred_obj[batch_idx], obj_mask).mean()
-                noobj_loss = self.lambda_noobj * (
-                    self.bce_loss(pred_obj[batch_idx], obj_mask) * noobj_mask
-                ).mean()
-                loss_dict['obj_loss'] += obj_loss + noobj_loss
-                
-                # Classification loss (only for cells with objects)
-                if obj_mask_bool.any():
-                    pred_cls_obj = pred_cls[batch_idx][obj_mask_bool]
-                    target_cls_obj = target_cls[obj_mask_bool]
-                    cls_loss = self.bce_loss(pred_cls_obj, target_cls_obj).mean()
-                    loss_dict['cls_loss'] += cls_loss
-        
-        # Average losses
-        num_scales = len(predictions)
-        for key in loss_dict:
-            loss_dict[key] /= (batch_size * num_scales)
-        
-        loss_dict['total_loss'] = (
-            loss_dict['bbox_loss'] + 
-            loss_dict['obj_loss'] + 
-            loss_dict['cls_loss']
-        )
-        
-        return loss_dict
+    
+    return {
+        'cls': torch.cat(all_cls, dim=0),
+        'bboxes': torch.cat(all_bboxes, dim=0),
+        'batch_idx': torch.cat(all_batch_idx, dim=0)
+    }
 
+def collate_fn(batch):
+    """Custom collate function to handle variable number of boxes."""
+    images = []
+    labels = []
+    
+    for img, label in batch:
+        images.append(img)
+        labels.append(label)
+    
+    images = torch.stack(images, dim=0)
+    return images, labels
 
-class Trainer:
-    def __init__(self, config_path):
-        """Initialize trainer with configuration file."""
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_length, 
+                   scaler, epoch, logger, max_grad_norm=10.0):
+    """
+    Performs one full epoch of training with mixed precision.
+    """
+    model.train()
+    total_loss = 0.0
+    loss_items_sum = torch.zeros(3, device=device)  # [box, cls, dfl]
+    num_batches = 0
+    
+    # Using tqdm for a progress bar
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1} [Train]")
+    
+    for batch_idx, (image_tensor, labels_list) in enumerate(pbar):
+        # image_tensor shape: (B, S, C, H, W)
+        # labels_list: list of tensors, each of shape (N, 5)
         
-        self.setup_logging()
-        self.setup_device()
-        self.setup_model()
-        self.setup_data()
-        self.setup_training()
+        B, S, C, H, W = image_tensor.shape
+        image_tensor = image_tensor.to(device)
         
-    def setup_logging(self):
-        """Setup logging and save directories."""
-        self.save_dir = Path(self.config['training']['save_dir'])
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        # Move labels to device
+        labels_list = [label.to(device) for label in labels_list]
         
-        # Setup logger
-        log_file = self.save_dir / f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Logging to {log_file}")
+        # Reset gradients for each new batch
+        optimizer.zero_grad()
         
-    def setup_device(self):
-        """Setup device (GPU/CPU) and seed."""
-        torch.manual_seed(self.config['training']['seed'])
-        np.random.seed(self.config['training']['seed'])
+        # Initialize hidden state for the LSTM at the start of each sequence
+        hidden_state = None
         
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.logger.info(f"Using device: {self.device}")
-        
-        if torch.cuda.is_available():
-            self.logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            self.logger.info(f"CUDA version: {torch.version.cuda}")
-            
-    def setup_model(self):
-        """Initialize model and loss function."""
-        model_cfg = self.config['model']
-        self.model = YOLOTemporalUNet(
-            num_classes=model_cfg['num_classes'],
-            yolo_model_name=model_cfg['yolo_model_name'],
-            feature_channels=model_cfg['feature_channels'],
-            use_conv_lstm=model_cfg['use_conv_lstm']
-        ).to(self.device)
-        
-        self.criterion = YOLOLoss(
-            num_classes=model_cfg['num_classes'],
-            lambda_coord=5.0,
-            lambda_noobj=0.5
-        )
-        
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(f"Total parameters: {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable_params:,}")
-        
-    def setup_data(self):
-        """Setup data loaders."""
-        train_cfg = self.config['training']
-        
-        self.train_dataset = DSECDataset(self.config, mode='train')
-        self.val_dataset = DSECDataset(self.config, mode='val')
-        
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=train_cfg['batch_size'],
-            shuffle=True,
-            num_workers=train_cfg['num_workers'],
-            pin_memory=True,
-            collate_fn=self.collate_fn
-        )
-        
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=train_cfg['batch_size'],
-            shuffle=False,
-            num_workers=train_cfg['num_workers'],
-            pin_memory=True,
-            collate_fn=self.collate_fn
-        )
-        
-        self.logger.info(f"Training samples: {len(self.train_dataset)}")
-        self.logger.info(f"Validation samples: {len(self.val_dataset)}")
-        
-    def collate_fn(self, batch):
-        """Custom collate function to handle variable number of boxes."""
-        images = []
-        labels = []
-        
-        for img, label in batch:
-            images.append(img)
-            labels.append(label)
-        
-        images = torch.stack(images, dim=0)
-        return images, labels
-        
-    def setup_training(self):
-        """Setup optimizer, scheduler, and other training components."""
-        train_cfg = self.config['training']
-        
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=train_cfg['learning_rate'],
-            weight_decay=train_cfg['weight_decay']
-        )
-        
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=train_cfg['epochs'],
-            eta_min=train_cfg['learning_rate'] * 0.01
-        )
-        
-        self.scaler = GradScaler()
-        self.best_val_loss = float('inf')
-        self.start_epoch = 0
-        
-    def train_epoch(self, epoch):
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0.0
-        loss_components = {'bbox_loss': 0.0, 'obj_loss': 0.0, 'cls_loss': 0.0}
-        
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config['training']['epochs']}")
-        
-        for batch_idx, (images, labels) in enumerate(pbar):
-            # images: (B, seq_len, C, H, W)
-            batch_size, seq_len, C, H, W = images.shape
-            images = images.to(self.device)
-            
-            self.optimizer.zero_grad()
-            
-            # Process sequence and accumulate loss
-            hidden_state = None
-            batch_loss = 0.0
-            batch_loss_components = {'bbox_loss': 0.0, 'obj_loss': 0.0, 'cls_loss': 0.0}
-            
-            for t in range(seq_len):
-                frame = images[:, t]  # (B, C, H, W)
+        # Loop through the time sequence
+        with autocast():
+            for t in range(sequence_length):
+                frame = image_tensor[:, t, :, :, :]
+                preds, hidden_state = model(frame, hidden_state)
                 
-                with autocast():
-                    predictions, hidden_state = self.model(frame, hidden_state)
-                    
-                    # Only compute loss for the last frame
-                    if t == seq_len - 1:
-                        # Get feature sizes
-                        feature_sizes = [
-                            (pred.shape[2], pred.shape[3]) for pred in predictions
-                        ]
-                        
-                        loss_dict = self.criterion(predictions, labels, feature_sizes)
-                        batch_loss = loss_dict['total_loss']
-                        
-                        for key in batch_loss_components:
-                            batch_loss_components[key] += loss_dict[key].item()
-                
-                # Detach hidden state to prevent backprop through time
+                # Detach hidden state to prevent backprop through entire sequence
                 if hidden_state is not None:
                     if isinstance(hidden_state, tuple):
                         hidden_state = tuple(h.detach() for h in hidden_state)
                     else:
                         hidden_state = hidden_state.detach()
             
-            # Backward pass
-            self.scaler.scale(batch_loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # Format labels for Ultralytics loss
+            batch_dict = format_batch_for_loss(labels_list, device)
             
-            # Update metrics
-            total_loss += batch_loss.item()
-            for key in loss_components:
-                loss_components[key] += batch_loss_components[key]
+            # Calculate loss on final frame predictions
+            loss, loss_items = loss_fn(preds, batch_dict)
+        
+        # Check for NaN loss
+        if not torch.isfinite(loss):
+            logger.warning(f"Loss is {loss.item()}, skipping batch {batch_idx}")
+            continue
+        
+        # Backpropagation with mixed precision
+        scaler.scale(loss).backward()
+        
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        
+        # Optimizer step
+        scaler.step(optimizer)
+        scaler.update()
+        
+        # Accumulate loss
+        total_loss += loss.item()
+        num_batches += 1
+        
+        # Accumulate loss items
+        loss_items_sum += loss_items.detach()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'box': f'{loss_items[0].item():.4f}',
+            'cls': f'{loss_items[1].item():.4f}',
+            'dfl': f'{loss_items[2].item():.4f}'
+        })
+    
+    if num_batches == 0:
+        logger.warning("No valid batches in training!")
+        return 0.0, torch.zeros(3)
+    
+    avg_loss = total_loss / num_batches
+    avg_loss_items = loss_items_sum / num_batches
+    
+    logger.info(f"Train - Loss: {avg_loss:.4f} | "
+                f"Box: {avg_loss_items[0]:.4f} | "
+                f"Cls: {avg_loss_items[1]:.4f} | "
+                f"DFL: {avg_loss_items[2]:.4f}")
+    
+    return avg_loss, avg_loss_items
+
+def validate_one_epoch(model, dataloader, loss_fn, device, sequence_length, epoch, logger):
+    """
+    Performs one full epoch of validation.
+    """
+    model.eval()
+    total_loss = 0.0
+    loss_items_sum = torch.zeros(3, device=device)
+    num_batches = 0
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1} [Val]")
+    
+    with torch.no_grad():
+        for batch_idx, (image_tensor, labels_list) in enumerate(pbar):
+            B, S, C, H, W = image_tensor.shape
+            image_tensor = image_tensor.to(device)
+            labels_list = [label.to(device) for label in labels_list]
             
-            # Update progress bar
+            hidden_state = None
+            
+            with autocast():
+                for t in range(sequence_length):
+                    frame = image_tensor[:, t, :, :, :]
+                    preds, hidden_state = model(frame, hidden_state)
+                    
+                    if hidden_state is not None:
+                        if isinstance(hidden_state, tuple):
+                            hidden_state = tuple(h.detach() for h in hidden_state)
+                        else:
+                            hidden_state = hidden_state.detach()
+                
+                # Format labels
+                batch_dict = format_batch_for_loss(labels_list, device)
+                
+                loss, loss_items = loss_fn(preds, batch_dict)
+            
+            if not torch.isfinite(loss):
+                logger.warning(f"Validation loss is {loss.item()}, skipping batch {batch_idx}")
+                continue
+            
+            total_loss += loss.item()
+            num_batches += 1
+            loss_items_sum += loss_items.detach()
+            
             pbar.set_postfix({
-                'loss': batch_loss.item(),
-                'bbox': batch_loss_components['bbox_loss'],
-                'obj': batch_loss_components['obj_loss'],
-                'cls': batch_loss_components['cls_loss']
+                'loss': f'{loss.item():.4f}',
+                'box': f'{loss_items[0].item():.4f}',
+                'cls': f'{loss_items[1].item():.4f}',
+                'dfl': f'{loss_items[2].item():.4f}'
             })
-        
-        # Calculate averages
-        num_batches = len(self.train_loader)
-        avg_loss = total_loss / num_batches
-        avg_components = {k: v / num_batches for k, v in loss_components.items()}
-        
-        return avg_loss, avg_components
     
-    @torch.no_grad()
-    def validate(self, epoch):
-        """Validate the model."""
-        self.model.eval()
-        total_loss = 0.0
-        loss_components = {'bbox_loss': 0.0, 'obj_loss': 0.0, 'cls_loss': 0.0}
-        
-        pbar = tqdm(self.val_loader, desc="Validation")
-        
-        for images, labels in pbar:
-            batch_size, seq_len, C, H, W = images.shape
-            images = images.to(self.device)
+    if num_batches == 0:
+        logger.warning("No valid batches in validation!")
+        return float('inf'), torch.zeros(3)
+    
+    avg_loss = total_loss / num_batches
+    avg_loss_items = loss_items_sum / num_batches
+    
+    logger.info(f"Val   - Loss: {avg_loss:.4f} | "
+                f"Box: {avg_loss_items[0]:.4f} | "
+                f"Cls: {avg_loss_items[1]:.4f} | "
+                f"DFL: {avg_loss_items[2]:.4f}")
+    
+    return avg_loss, avg_loss_items
+
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, val_loss, 
+                   save_path, config, logger):
+    """Save model checkpoint with all training state."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'scaler_state_dict': scaler.state_dict(),
+        'val_loss': val_loss,
+        'config': config,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'user': 'Resnick28'
+    }
+    torch.save(checkpoint, save_path)
+    logger.info(f"Checkpoint saved to {save_path}")
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device, logger):
+    """Load checkpoint and restore training state."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    best_val_loss = checkpoint['val_loss']
+    
+    logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+    logger.info(f"Checkpoint saved by: {checkpoint.get('user', 'Unknown')}")
+    logger.info(f"Checkpoint timestamp: {checkpoint.get('timestamp', 'Unknown')}")
+    
+    return start_epoch, best_val_loss
+
+def main(resume_from=None):
+    """
+    Main function to run the training and validation process.
+    """
+    with open("config.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # --- Setup ---
+    set_seed(config['training']['seed'])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create directory for saving runs
+    save_dir = Path(config['training']['save_dir'])
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup logging
+    logger = setup_logging(save_dir)
+    logger.info("="*80)
+    logger.info(f"Training started by: Resnick28")
+    logger.info(f"Training start time: 2025-10-20 05:06:44 UTC")
+    logger.info(f"Using device: {device}")
+    
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    logger.info("="*80)
+    
+    # --- Data Loading ---
+    logger.info("Loading datasets...")
+    full_train_dataset = DSECDataset(config, mode="train")
+
+    # Group indices by sequence (assuming samples from same sequence are contiguous)
+    sequence_groups = {}
+    for idx in range(len(full_train_dataset)):
+        image_dir, _, _ = full_train_dataset.samples[idx]
+        seq_name = str(image_dir)
+        if seq_name not in sequence_groups:
+            sequence_groups[seq_name] = []
+        sequence_groups[seq_name].append(idx)
+
+    # Split sequences (not individual samples)
+    sequence_names = list(sequence_groups.keys())
+    train_seqs, val_seqs = train_test_split(
+        sequence_names,
+        test_size=0.2,
+        random_state=42,
+        shuffle=True
+    )
+
+    # Collect all indices from train and val sequences
+    train_indices = []
+    for seq in train_seqs:
+        train_indices.extend(sequence_groups[seq])
+
+    val_indices = []
+    for seq in val_seqs:
+        val_indices.extend(sequence_groups[seq])
+
+    # Create subset datasets
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_train_dataset, val_indices)
+    
+    logger.info(f"Training samples: {len(train_dataset)}")
+    logger.info(f"Validation samples: {len(val_dataset)}")
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=config['training']['num_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        persistent_workers=True if config['training']['num_workers'] > 0 else False
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['training']['num_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        persistent_workers=True if config['training']['num_workers'] > 0 else False
+    )
+    
+    # --- Model Initialization ---
+    logger.info("Initializing model...")
+    model_config = config['model']
+    model = YOLOTemporalUNet(
+        num_classes=model_config['num_classes'],
+        yolo_model_name=model_config['yolo_model_name'],
+        feature_channels=tuple(model_config['feature_channels']),
+        use_conv_lstm=model_config['use_conv_lstm']
+    ).to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+    
+    # --- Loss Function with Wrapper ---
+    logger.info("Initializing loss function...")
+    loss_fn = YOLOLossWrapper(model, num_classes=model_config['num_classes'])
+    
+    # --- Optimizer, Scheduler ---
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay']
+    )
+    
+    # Cosine annealing scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config['training']['epochs'],
+        eta_min=config['training']['learning_rate'] * 0.01
+    )
+    
+    # Mixed precision scaler
+    scaler = GradScaler()
+    
+    # --- Load checkpoint if resuming ---
+    start_epoch = 0
+    best_val_loss = float('inf')
+    
+    if resume_from:
+        start_epoch, best_val_loss = load_checkpoint(
+            resume_from, model, optimizer, scheduler, scaler, device, logger
+        )
+        logger.info(f"Resuming from epoch {start_epoch}")
+    
+    # --- Training Loop ---
+    logger.info("Starting training loop...")
+    
+    try:
+        for epoch in range(start_epoch, config['training']['epochs']):
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Epoch {epoch+1}/{config['training']['epochs']}")
+            logger.info(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+            logger.info(f"{'='*80}")
             
-            # Process sequence
-            hidden_state = None
-            
-            for t in range(seq_len):
-                frame = images[:, t]
-                
-                with autocast():
-                    predictions, hidden_state = self.model(frame, hidden_state)
-                    
-                    # Only compute loss for the last frame
-                    if t == seq_len - 1:
-                        feature_sizes = [
-                            (pred.shape[2], pred.shape[3]) for pred in predictions
-                        ]
-                        
-                        loss_dict = self.criterion(predictions, labels, feature_sizes)
-                        total_loss += loss_dict['total_loss'].item()
-                        
-                        for key in loss_components:
-                            loss_components[key] += loss_dict[key].item()
-                
-                if hidden_state is not None:
-                    if isinstance(hidden_state, tuple):
-                        hidden_state = tuple(h.detach() for h in hidden_state)
-                    else:
-                        hidden_state = hidden_state.detach()
-            
-            pbar.set_postfix({'loss': loss_dict['total_loss'].item()})
-        
-        # Calculate averages
-        num_batches = len(self.val_loader)
-        avg_loss = total_loss / num_batches
-        avg_components = {k: v / num_batches for k, v in loss_components.items()}
-        
-        return avg_loss, avg_components
-    
-    def save_checkpoint(self, epoch, val_loss, is_best=False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'val_loss': val_loss,
-            'config': self.config
-        }
-        
-        # Save last checkpoint
-        last_path = self.save_dir / 'last.pt'
-        torch.save(checkpoint, last_path)
-        self.logger.info(f"Saved checkpoint: {last_path}")
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = self.save_dir / 'best.pt'
-            torch.save(checkpoint, best_path)
-            self.logger.info(f"Saved best checkpoint: {best_path}")
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.best_val_loss = checkpoint['val_loss']
-        self.logger.info(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
-    
-    def train(self):
-        """Main training loop."""
-        self.logger.info("Starting training...")
-        
-        for epoch in range(self.start_epoch, self.config['training']['epochs']):
             # Train
-            train_loss, train_components = self.train_epoch(epoch)
-            
-            # Validate
-            val_loss, val_components = self.validate(epoch)
-            
-            # Update scheduler
-            self.scheduler.step()
-            
-            # Log metrics
-            self.logger.info(
-                f"Epoch {epoch+1}/{self.config['training']['epochs']} - "
-                f"Train Loss: {train_loss:.4f} "
-                f"(bbox: {train_components['bbox_loss']:.4f}, "
-                f"obj: {train_components['obj_loss']:.4f}, "
-                f"cls: {train_components['cls_loss']:.4f}) - "
-                f"Val Loss: {val_loss:.4f} "
-                f"(bbox: {val_components['bbox_loss']:.4f}, "
-                f"obj: {val_components['obj_loss']:.4f}, "
-                f"cls: {val_components['cls_loss']:.4f}) - "
-                f"LR: {self.optimizer.param_groups[0]['lr']:.6f}"
+            train_loss, train_loss_items = train_one_epoch(
+                model=model,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                loss_fn=loss_fn,
+                device=device,
+                sequence_length=config['dataset']['train']['seq_len'],
+                scaler=scaler,
+                epoch=epoch,
+                logger=logger,
+                max_grad_norm=config['training'].get('max_grad_norm', 10.0)
             )
             
-            # Save checkpoint
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_loss
+            # Validate
+            val_loss, val_loss_items = validate_one_epoch(
+                model=model,
+                dataloader=val_loader,
+                loss_fn=loss_fn,
+                device=device,
+                sequence_length=config['dataset']['val']['seq_len'],
+                epoch=epoch,
+                logger=logger
+            )
             
-            self.save_checkpoint(epoch, val_loss, is_best)
+            # Step scheduler
+            scheduler.step()
+            
+            # --- Save Checkpoints ---
+            # Save the latest model
+            latest_checkpoint_path = save_dir / "latest.pt"
+            save_checkpoint(
+                model, optimizer, scheduler, scaler, epoch, val_loss,
+                latest_checkpoint_path, config, logger
+            )
+            
+            # Save the best model based on validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_checkpoint_path = save_dir / "best.pt"
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, epoch, val_loss,
+                    best_checkpoint_path, config, logger
+                )
+                logger.info(f"✓ New best model! Validation loss: {best_val_loss:.4f}")
+            
+            # Save periodic checkpoint every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                periodic_path = save_dir / f"epoch_{epoch+1}.pt"
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, epoch, val_loss,
+                    periodic_path, config, logger
+                )
         
-        self.logger.info("Training completed!")
-        self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+        logger.info("\n" + "="*80)
+        logger.info("Training finished successfully!")
+        logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        logger.info(f"Training completed by: Resnick28")
+        logger.info(f"Training end time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        logger.info("="*80)
+        
+    except KeyboardInterrupt:
+        logger.warning("\nTraining interrupted by user!")
+        logger.info("Saving interrupt checkpoint...")
+        interrupt_path = save_dir / "interrupt.pt"
+        save_checkpoint(
+            model, optimizer, scheduler, scaler, epoch, val_loss,
+            interrupt_path, config, logger
+        )
+        logger.info(f"Interrupt checkpoint saved to {interrupt_path}")
+        
+    except Exception as e:
+        logger.error(f"\nTraining failed with error: {str(e)}")
+        logger.exception("Full traceback:")
+        raise
 
 
-def main():
+if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Train YOLOTemporalUNet on DSEC dataset')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from (e.g., runs/train/exp1/latest.pt)')
     parser.add_argument('--config', type=str, default='config.yaml',
                        help='Path to configuration file')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
     
     args = parser.parse_args()
     
-    # Initialize trainer
-    trainer = Trainer(args.config)
+    # Update config path if provided
+    if args.config != 'config.yaml':
+        print(f"Using config: {args.config}")
     
-    # Resume from checkpoint if specified
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-    
-    # Start training
-    trainer.train()
-
-
-if __name__ == '__main__':
-    main()
-
-
+    main(resume_from=args.resume)
 
 
 
