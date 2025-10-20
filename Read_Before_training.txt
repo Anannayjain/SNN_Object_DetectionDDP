@@ -1,0 +1,40 @@
+Configuration for YOLOTemporalUNet Training
+
+--- Model Configuration ---
+
+model:
+num_classes: 2      # Number of object classes in DSEC (e.g., Car, Pedestrian)
+yolo_model_name: 'yolov8n.pt'  # Pre-trained YOLO model to use as a backbone
+
+IMPORTANT: Feature channels extracted from the YOLO backbone.
+
+These MUST match the output of the YOLOFeatureExtractor for the chosen model.
+
+Run the model.py script once to see the detected shapes if you are unsure.
+
+Example for yolov8n.pt:
+
+feature_channels: [128, 256, 512]
+
+use_conv_lstm: True # Set to False to use a standard LSTM (not recommended)
+
+--- Dataset Configuration ---
+
+dataset:
+train:
+path: "/path/to/your/dsec_dataset/train"
+seq_len: 10 # Number of frames in each training sequence
+val:
+path: "/path/to/your/dsec_dataset/val"
+seq_len: 10 # Should be the same as train for consistency
+
+--- Training Configuration ---
+
+training:
+seed: 42
+epochs: 50
+batch_size: 4       # Adjust based on your GPU memory
+num_workers: 4      # Number of CPU cores for data loading
+learning_rate: 0.0001
+weight_decay: 0.0005
+save_dir: "runs/train/exp1" # Directory to save checkpoints and logs

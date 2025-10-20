@@ -1,0 +1,4 @@
+2025-10-20 10:13:08,239 [INFO] Logging to runs/train/exp1/training_20251020_101308.log
+2025-10-20 10:13:08,386 [INFO] Using device: cuda
+2025-10-20 10:13:08,468 [INFO] GPU: NVIDIA RTX A6000
+2025-10-20 10:13:08,476 [INFO] CUDA version: 12.4
