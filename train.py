@@ -1,179 +1,134 @@
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import yaml
 from tqdm import tqdm
-import os
-from pathlib import Path
-import random
-import numpy as np
-from torch.utils.data import Subset
-from sklearn.model_selection import train_test_split
-from collections import defaultdict
-
-# --- Import your custom modules ---
-from model import YOLOTemporalUNet
-from dataset import DSECDataset
+import torch.optim as optim
 
 from ultralytics.utils.loss import v8DetectionLoss
+from ultralytics.models.yolo.detect.train import DetectionTrainer
 
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle samples with a variable number of labels.
+    """
+    # batch is a list of tuples: [(img_seq_1, labels_1), (img_seq_2, labels_2), ...]
+    # img_seq_1 shape: (S, C, H, W)
+    # labels_1 shape: (N, 5)  (where N is variable)
+    
+    img_sequences = []
+    labels_list = []
+    
+    for i, (img_seq, labels) in enumerate(batch):
+        img_sequences.append(img_seq)        
+        # Check if there are any labels
+        if labels.shape[0] > 0:
+            # Create a batch index tensor, shape (N, 1)
+            # This 'i' is the batch_index for this sample
+            batch_index = torch.full((labels.shape[0], 1), i, dtype=labels.dtype, device=labels.device)            
+            # Prepend batch index: (N, 5) -> (N, 6)
+            # [class, x, y, w, h] -> [batch_idx, class, x, y, w, h]
+            labels_with_index = torch.cat([batch_index, labels], dim=1)
+            labels_list.append(labels_with_index)
+    # Stack all image sequences: list of (S, C, H, W) -> (B, S, C, H, W)
+    images_batch = torch.stack(img_sequences, 0)
+    
+    # Concatenate all labels into one big tensor (Total_Objects, 6)
+    if labels_list:
+        labels_batch = torch.cat(labels_list, 0)
+    else:
+        # Handle case where no labels are in the entire batch
+        # We still need 6 columns to match the expected format
+        # Use float() to match image_tensor type, though it will be moved to device later
+        labels_batch = torch.empty(0, 6, dtype=torch.float32) 
+        
+    return images_batch, labels_batch
+# -----------------------------------------------------
+
 
 def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_length):
-    """
-    Performs one full epoch of training.
-    """
     model.train()
     total_loss = 0.0
-    
-    # Using tqdm for a progress bar
     pbar = tqdm(dataloader, desc="Training")
     
     for batch_idx, (image_tensor, labels_tensor) in enumerate(pbar):
-        # image_tensor shape: (B, S, C, H, W)
-        # labels_tensor shape: (B, N, 5) where N is number of objects
-        
         image_tensor = image_tensor.to(device)
         labels_tensor = labels_tensor.to(device)
-        
-        # Reset gradients for each new batch
         optimizer.zero_grad()
-        
-        # Initialize hidden state for the LSTM at the start of each sequence
         hidden_state = None
         
-        # Loop through the time sequence
         for t in range(sequence_length):
             frame = image_tensor[:, t, :, :, :]
             preds, hidden_state = model(frame, hidden_state)
-
-        # The loss is calculated only on the predictions from the final frame
-        loss, _ = loss_fn(preds, labels_tensor)
-        
-        # Backpropagation
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
+            hidden_state = (hidden_state[0].detach(), hidden_state[1].detach()) # truncate gradients
+            
+            batch_dict = {
+                    'batch_idx': labels_tensor[:, 0],
+                    'cls': labels_tensor[:, 1],
+                    'bboxes': labels_tensor[:, 2:]
+                }        
+            # loss_components is a tensor of size [3] (box, cls, dfl)
+            loss_components, _ = loss_fn(preds, batch_dict)        
+            # Sum the components to get the final scalar loss
+            scalar_loss = loss_components.sum()
+            # Backpropagation
+            scalar_loss.backward()               
+            optimizer.step()        
+            total_loss += scalar_loss.item() # Use the scalar_loss        
         # Update progress bar description
-        pbar.set_postfix(loss=f'{loss.item():.4f}')
-        
+        pbar.set_postfix(loss=f'{scalar_loss.item():.4f}') # Use the scalar_loss
     return total_loss / len(dataloader)
 
 def validate_one_epoch(model, dataloader, loss_fn, device, sequence_length):
-    """
-    Performs one full epoch of validation.
-    """
     model.eval()
     total_loss = 0.0
-    
     pbar = tqdm(dataloader, desc="Validation")
     
     with torch.no_grad():
         for batch_idx, (image_tensor, labels_tensor) in enumerate(pbar):
-            image_tensor = image_tensor.to(device)
-            labels_tensor = labels_tensor.to(device)
-            
-            hidden_state = None
-            
+            # ... (image/label moving and sequence loop are all correct) ...            
             for t in range(sequence_length):
                 frame = image_tensor[:, t, :, :, :]
-                preds, hidden_state = model(frame, hidden_state)
-                
-            loss, _ = loss_fn(preds, labels_tensor)
-            total_loss += loss.item()
-            
-            pbar.set_postfix(loss=f'{loss.item():.4f}')
+                preds, hidden_state = model(frame, hidden_state)            
+            batch_dict = {
+                    'batch_idx': labels_tensor[:, 0],
+                    'cls': labels_tensor[:, 1],
+                    'bboxes': labels_tensor[:, 2:]
+                }
+            loss_components, _ = loss_fn(preds, batch_dict)
+            scalar_loss = loss_components.sum() # Sum components            
+            total_loss += scalar_loss.item() # Use scalar_loss            
+            pbar.set_postfix(loss=f'{scalar_loss.item():.4f}') # Use scalar_loss
 
     return total_loss / len(dataloader)
 
-
-if __name__ == "__main__":
-    with open("config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    
-    """
-    Main function to run the training and validation process.
-    """
-    set_seed(config['training']['seed'])
-    
-    # --- Setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Create directory for saving runs
-    save_dir = Path(config['training']['save_dir'])
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # --- Data Loading ---
-    print("Loading datasets...")
-    full_train_dataset = DSECDataset(config, mode="train")
-
-    # Group indices by sequence
-    seq_groups = defaultdict(list)
-    for idx, (img_dir, _, _) in enumerate(full_train_dataset.samples):
-        seq_groups[str(img_dir)].append(idx)
-
-    # Split and build indices efficiently
-    train_seqs, val_seqs = train_test_split(list(seq_groups), test_size=0.2, random_state=42)
-    train_seqs, val_seqs = set(train_seqs), set(val_seqs)  # O(1) lookup
-
-    train_indices, val_indices = [], []
-    for seq, indices in seq_groups.items():
-        (train_indices if seq in train_seqs else val_indices).extend(indices)
-
-    train_dataset = Subset(full_train_dataset, train_indices)
-    val_dataset = Subset(full_train_dataset, val_indices)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=True,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True
-    )
-    
-    # --- Model Initialization ---
-    print("Initializing model...")
-    model_config = config['model']
-    model = YOLOTemporalUNet(
-        num_classes=model_config['num_classes'],
-        yolo_model_name=model_config['yolo_model_name'],
-        feature_channels=tuple(model_config['feature_channels']),
-        use_conv_lstm=model_config['use_conv_lstm']
-    ).to(device)
-    
+def train_loop(model, train_loader, val_loader, config, device, save_dir):
     # --- Loss Function, Optimizer ---
-    # The v8DetectionLoss class from ultralytics handles the complex
-    # box, class, and objectness losses for you.
+    overrides_cfg = {
+        'model': config["model"]['yolo_model_name'],  # A base model for the trainer to load default cfgs
+        'data': 'coco128.yaml',   # Placeholder, not actually used for data loading
+        'epochs': config['training']['epochs'],
+        'imgsz': 640,
+        # === Key arguments for the loss function ===
+        'box': 7.5,
+        'cls': 0.5,
+        'dfl': 1.5,
+    }
+
+    # Use a dummy trainer to setup the loss function correctly
+    trainer = DetectionTrainer(overrides=overrides_cfg)
+    trainer.model = model
+    trainer.args.nc = config['model']['num_classes']
+    model.args = trainer.args # The loss function reads properties from model.args
+
     loss_fn = v8DetectionLoss(model)
-    
+        
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=config['training']['learning_rate'],
         weight_decay=config['training']['weight_decay']
     )
-    
+
     # --- Training Loop ---
     best_val_loss = float('inf')
-    
+
     for epoch in range(config['training']['epochs']):
         print(f"\n--- Epoch {epoch+1}/{config['training']['epochs']} ---")
         
@@ -192,7 +147,7 @@ if __name__ == "__main__":
             val_loader, 
             loss_fn, 
             device, 
-            config['dataset']['val']['seq_len']
+            config['dataset']['train']['seq_len']
         )
         print(f"Average Validation Loss: {val_loss:.4f}")
         
@@ -200,7 +155,6 @@ if __name__ == "__main__":
         # Save the latest model
         latest_checkpoint_path = save_dir / "latest.pt"
         torch.save(model.state_dict(), latest_checkpoint_path)
-        print(f"Saved latest model checkpoint to {latest_checkpoint_path}")
 
         # Save the best model based on validation loss
         if val_loss < best_val_loss:
@@ -208,6 +162,8 @@ if __name__ == "__main__":
             best_checkpoint_path = save_dir / "best.pt"
             torch.save(model.state_dict(), best_checkpoint_path)
             print(f"New best model saved to {best_checkpoint_path} with validation loss: {best_val_loss:.4f}")
+        else:
+            print(f"Saved latest model checkpoint to {latest_checkpoint_path}")
+
 
     print("\nTraining finished!")
-

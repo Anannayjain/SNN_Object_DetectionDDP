@@ -9,6 +9,8 @@ dataset:
     path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test"
     seq_len: 5
 
+mode: "train"  # Options: "train" or "test"
+
 training:
   seed: 42
   epochs: 50
@@ -19,7 +21,6 @@ training:
   save_dir: "runs/train/exp1" # Directory to save checkpoints and logs
 
 model:
-  num_classes: 2      # Number of object classes
+  num_classes: 8      # Number of object classes
   yolo_model_name: 'yolo11m.pt'  # Pre-trained YOLO model to use as a backbone
-  feature_channels: [1024, 768, 1024]
   use_conv_lstm: True # Set to False to use a standard LSTM (not recommended)

@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 from ultralytics import YOLO
+from ultralytics.nn.modules.head import Detect
+import torch.nn.functional as F
 
 # --- Helper Modules ---
-
 class ConvBlock(nn.Module):
     """Standard Convolutional Block: Conv -> BatchNorm -> SiLU"""
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -37,7 +38,9 @@ class UpBlock(nn.Module):
         self.conv2 = ConvBlock(out_channels, out_channels)
 
     def forward(self, x, skip_x):
-        x = self.up(x)        
+        x = self.up(x) 
+        if x.shape[2:] != skip_x.shape[2:]:
+            skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([skip_x, x], dim=1)
         x = self.conv1(x)
         x = self.conv2(x)
@@ -69,30 +72,29 @@ class ConvLSTM2d(nn.Module):
 # --- Main Components ---
 class YOLOFeatureExtractor(nn.Module):
     """Extract multi-scale features from YOLO backbone using hooks"""
-    def __init__(self, model_name='yolo11m.pt', freeze=True, feature_layers=[15, 18, 21]):
+    def __init__(self, model_name='yolo11m.pt', freeze=True):
         super().__init__()
         self.model = YOLO(model_name).model
-        self.features = {}
-        self.feature_layers = feature_layers
-        self.hooks = [self.model.model[i].register_forward_hook(self._make_hook(i)) 
-                     for i in feature_layers]
-        
         if freeze:
             for param in self.model.parameters():
                 param.requires_grad = False
             self.model.eval()
     
-    def _make_hook(self, layer_id):
-        return lambda m, i, o: self.features.update({layer_id: o})
+    def train(self, mode=True):
+        self.training = mode
+        self.model.eval()
     
     def forward(self, x):
-        self.features.clear()
-        _ = self.model(x)
-        return tuple(self.features[i] for i in self.feature_layers)
-    
-    def __del__(self):
-        for hook in self.hooks:
-            hook.remove()
+        with torch.no_grad():
+            _, features = self.model(x)
+        return tuple(features)
+
+    @torch.no_grad()
+    def get_feature_channels(self, dummy_input_shape=(1, 3, 640, 640)):
+        """Helper to get feature channel counts dynamically."""
+        dummy_input = torch.randn(*dummy_input_shape, device=next(self.model.parameters()).device)        
+        _, features = self.model(dummy_input)
+        return [f.shape[1] for f in features]
 
 class TemporalUNet(nn.Module):
     """U-Net with LSTM bottleneck for temporal modeling"""
@@ -142,32 +144,23 @@ class TemporalUNet(nn.Module):
         
         return (self.out_p3(d3), self.out_p4(d2), self.out_p5(d1)), new_hidden
 
+
 class YOLOTemporalUNet(nn.Module):
     """
     Main model combining YOLO feature extraction with temporal U-Net processing.
     Suitable for video object detection or tracking tasks.
     """
     def __init__(self, num_classes=80, yolo_model_name='yolo11m.pt', 
-                 feature_channels=None, use_conv_lstm=True):
+                 use_conv_lstm=True):
         super(YOLOTemporalUNet, self).__init__()
         
         self.feature_extractor = YOLOFeatureExtractor(model_name=yolo_model_name, freeze=True)
+        feature_channels = self.feature_extractor.get_feature_channels()
         self.temporal_unet = TemporalUNet(feature_channels=feature_channels, 
                                          use_conv_lstm=use_conv_lstm)
-        
-        # Load YOLO and extract its detection head
-        yolo = YOLO(yolo_model_name)
-        self.detect_head = yolo.model.model[-1]  # The Detect module
-        
-        # Ensure the detect head expects the right number of channels
-        # self.proj_p3 = nn.Conv2d(feature_channels[0], self.detect_head.ch[0], 1)
-        # self.proj_p4 = nn.Conv2d(feature_channels[1], self.detect_head.ch[1], 1)
-        # self.proj_p5 = nn.Conv2d(feature_channels[2], self.detect_head.ch[2], 1)
 
-        # Detection heads for each scale
-        # self.head_p3 = nn.Conv2d(feature_channels[0], num_classes + 5, kernel_size=1)
-        # self.head_p4 = nn.Conv2d(feature_channels[1], num_classes + 5, kernel_size=1)
-        # self.head_p5 = nn.Conv2d(feature_channels[2], num_classes + 5, kernel_size=1)
+        self.detection_head = Detect(nc=num_classes, ch=feature_channels)
+        self.model = nn.ModuleList([self.detection_head])
 
     def forward(self, x, hidden_state=None):
         """
@@ -181,78 +174,6 @@ class YOLOTemporalUNet(nn.Module):
         """
         yolo_features = self.feature_extractor(x)
         temporal_features, new_hidden = self.temporal_unet(yolo_features, hidden_state)
-        
-        out_p3, out_p4, out_p5 = temporal_features
+        detections = self.detection_head(list(temporal_features))
 
-        # print("hh", out_p3.shape, out_p4.shape, out_p5.shape)
-        # Project temporal features to match YOLO head input channels
-        # out_p3 = self.proj_p3(temporal_features[0])
-        # out_p4 = self.proj_p4(temporal_features[1])
-        # out_p5 = self.proj_p5(temporal_features[2])
-
-        # detections = self.detect_head([out_p3, out_p4, out_p5])
-
-        # det_p3 = self.head_p3(out_p3)
-        # det_p4 = self.head_p4(out_p4)
-        # det_p5 = self.head_p5(out_p5)
-        
         return detections, new_hidden
-
-# --- Example Usage ---
-if __name__ == '__main__':
-    print("Initializing model...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    if not torch.cuda.is_available():
-        print("WARNING: Running on CPU. This will be very slow.")
-    
-    # Initialize model
-    model = YOLOTemporalUNet(
-        num_classes=80,
-        yolo_model_name='yolo11m.pt',
-        feature_channels=(1024, 768, 1024),  # Adjusted feature channels based on extracted features
-        use_conv_lstm=True  # Set to False to use standard LSTM
-    ).to(device)
-    
-    dummy_input = torch.randn(2, 3, 640, 640).to(device)
-    
-    # outputs1, hidden1 = model(dummy_input, hidden_state=None)
-
-    print("\nPerforming test forward pass...")
-    try:
-        with torch.no_grad():
-            # First frame (no hidden state)
-            outputs1, hidden1 = model(dummy_input, hidden_state=None)
-            
-            # Second frame (with hidden state for temporal continuity)
-            outputs2, hidden2 = model(dummy_input, hidden_state=hidden1)
-        
-        print(f"\nInput shape: {dummy_input.shape}")
-        print(f"Output P3 shape: {outputs1[0].shape}")
-        print(f"Output P4 shape: {outputs1[1].shape}")
-        print(f"Output P5 shape: {outputs1[2].shape}")
-        print("\nModel test successful!")
-        
-        # Count parameters
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\nTotal parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        
-    except Exception as e:
-        print(f"\nError during forward pass: {e}")
-        print("\nTrying to extract YOLO features to determine correct feature channels...")
-        
-        try:
-            with torch.no_grad():
-                p3, p4, p5 = model.feature_extractor(dummy_input)
-                print(f"\nDetected YOLO feature channels:")
-                print(f"P3: {p3.shape}")
-                print(f"P4: {p4.shape}")
-                print(f"P5: {p5.shape}")
-                print(f"\nPlease reinitialize the model with:")
-                print(f"feature_channels=({p3.shape[1]}, {p4.shape[1]}, {p5.shape[1]})")
-        except Exception as e2:
-            print(f"Error extracting features: {e2}")
-            print("\nPlease check your YOLO model version and adjust feature extraction indices.")
