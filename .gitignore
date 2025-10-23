@@ -1,0 +1,51 @@
+# === Python cache ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# === Logs and temporary files ===
+*.log
+*.tmp
+*.out
+*.bak
+
+# === Model weights and checkpoints ===
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# === Training runs and outputs ===
+runs/
+debug_dataset.py
+*_test_*.py
+*.ipynb_checkpoints/
+
+# === Datasets (if any) ===
+data/
+datasets/
+*.zip
+*.tar
+*.gz
+
+# === Virtual environment ===
+venv/
+.env/
+.lora/
+*.egg-info/
+build/
+dist/
+
+# === IDE / OS files ===
+.vscode/
+.idea/
+.DS_Store
+
+# === TensorBoard events ===
+events.out.tfevents.*
+
+# === Other large files ===
+*.npy
+*.npz
+*.csv

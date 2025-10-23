@@ -39,6 +39,7 @@ class DSECDataset(Dataset):
             if self.mode in ['train', 'val']:
                 track_file = seq_path / 'object_detections/left/tracks.npy'
                 tracks = np.load(track_file)
+                # print(tracks[0])
                 self.all_labels[str(image_dir)] = self._process_tracks(tracks, frame_timestamps)
             
             if num_images >= self.sequence_length:
@@ -63,7 +64,9 @@ class DSECDataset(Dataset):
         """
         labels = {}
         detection_ts = tracks['t']
+        # print(detection_ts)
         indices = np.searchsorted(frame_timestamps, detection_ts, side='left')
+        # print(indices)
 
         indices = np.clip(indices, 0, len(frame_timestamps) - 1)
         ts_before = frame_timestamps[np.maximum(0, indices - 1)]
@@ -88,18 +91,64 @@ class DSECDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):        
+    # def __getitem__(self, idx):        
+    #     image_dir, image_files, start_idx = self.samples[idx]
+        
+    #     img_h, img_w = None, None
+    #     sequence_images = []
+
+    #     for i in range(self.sequence_length):
+    #         img_path = str(image_dir / image_files[start_idx + i])
+    #         image = cv2.imread(img_path)
+    #         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+    #         if i == self.sequence_length - 1:
+    #             img_h, img_w, _ = image.shape
+
+    #         if self.transform:
+    #             image = self.transform(image)
+    #         else:
+    #             image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    #         sequence_images.append(image)
+        
+    #     image_tensor = torch.stack(sequence_images)
+        
+    #     if self.mode in ['train', 'val']:
+    #         target_frame_idx = start_idx + self.sequence_length - 1
+    #         sequence_labels = self.all_labels.get(str(image_dir), {})
+    #         target_labels = sequence_labels.get(target_frame_idx, [])
+    #         if target_labels:                
+    #             labels_np = np.array(target_labels, dtype=np.float32)
+    #             labels_np[:, 1:] /= [img_w, img_h, img_w, img_h]
+    #             labels_tensor = torch.tensor(labels_np)
+    #         else:
+    #             labels_tensor = torch.empty((0, 5), dtype=torch.float32)
+    #         return image_tensor, labels_tensor
+    #     else: # self.mode == 'test'
+    #         last_frame_path = str(Path(image_dir) / image_files[start_idx + self.sequence_length - 1])
+    #         return image_tensor, last_frame_path
+    # In DSECDataset class in dataset.py
+
+    def __getitem__(self, idx):      
         image_dir, image_files, start_idx = self.samples[idx]
         
         sequence_images = []
+        img_h, img_w = None, None 
+        
         for i in range(self.sequence_length):
             img_path = str(image_dir / image_files[start_idx + i])
             image = cv2.imread(img_path)
+            
+            if i == self.sequence_length - 1:
+                # Store original dimensions for normalization
+                img_h, img_w, _ = image.shape
+                
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
             if self.transform:
                 image = self.transform(image)
             else:
+                # Note: No resize here. Assumes all images are same (H, W)
                 image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
             sequence_images.append(image)
         
@@ -109,10 +158,70 @@ class DSECDataset(Dataset):
             target_frame_idx = start_idx + self.sequence_length - 1
             sequence_labels = self.all_labels.get(str(image_dir), {})
             target_labels = sequence_labels.get(target_frame_idx, [])
+            
             if target_labels:
-                labels_tensor = torch.tensor(np.array(target_labels), dtype=torch.float32)
+                labels_array = np.array(target_labels, dtype=np.float32) # Shape (N, 5)
+                # --- ADD A PRINT HERE ---
+                # print(f"DEBUG: Frame {target_frame_idx} started with {labels_array.shape[0]} labels.")
+
+                # 1. First-pass filter (from previous fix)
+                mask = (labels_array[:, 3] > 0) & (labels_array[:, 4] > 0)
+                labels_array = labels_array[mask]
+                
+                # Check if any valid labels remain
+                if labels_array.shape[0] > 0 and img_h is not None and img_w is not None:
+                    
+                    # 2. Normalize
+                    labels_array[:, 1] /= img_w  # cx
+                    labels_array[:, 2] /= img_h  # cy
+                    labels_array[:, 3] /= img_w  # w
+                    labels_array[:, 4] /= img_h  # h
+
+                    # --- START OF NEW FIX ---
+                    
+                    # 3. Clip out-of-bounds boxes
+                    # Convert to xyxy for easier clipping
+                    cx = labels_array[:, 1]
+                    cy = labels_array[:, 2]
+                    w = labels_array[:, 3]
+                    h = labels_array[:, 4]
+                    
+                    x1 = np.clip(cx - w / 2, 0, 1)
+                    y1 = np.clip(cy - h / 2, 0, 1)
+                    x2 = np.clip(cx + w / 2, 0, 1)
+                    y2 = np.clip(cy + h / 2, 0, 1)
+                    
+                    # Convert back to cxcywh
+                    labels_array[:, 1] = (x1 + x2) / 2
+                    labels_array[:, 2] = (y1 + y2) / 2
+                    labels_array[:, 3] = (x2 - x1)
+                    labels_array[:, 4] = (y2 - y1)
+                    
+                    # 4. Re-filter: Clipping might have created new zero-area boxes
+                    mask = (labels_array[:, 3] > 0) & (labels_array[:, 4] > 0)
+                    labels_array = labels_array[mask]
+                    
+                    # --- END OF NEW FIX ---
+
+                    # --- ADDED THE SECOND PRINT STATEMENT HERE ---
+                    # print(f"DEBUG: Frame {target_frame_idx} finished with {labels_array.shape[0]} labels.\n")
+                    # ---------------------------------------------
+
+                    # Check again if any valid labels remain after clipping
+                    if labels_array.shape[0] > 0:
+                        labels_tensor = torch.tensor(labels_array, dtype=torch.float32)
+                    else:
+                        labels_tensor = torch.empty((0, 5), dtype=torch.float32)
+                
+                else:
+                    # No labels remained after first-pass filter
+                    # print(f"DEBUG: Frame {target_frame_idx} finished with 0 labels (failed first filter).\n") # Added print here too
+                    labels_tensor = torch.empty((0, 5), dtype=torch.float32)
             else:
+                # No labels for this frame
+                # print(f"DEBUG: Frame {target_frame_idx} finished with 0 labels (no target_labels).\n") # Added print here too
                 labels_tensor = torch.empty((0, 5), dtype=torch.float32)
+                
             return image_tensor, labels_tensor
         else: # self.mode == 'test'
             last_frame_path = str(Path(image_dir) / image_files[start_idx + self.sequence_length - 1])

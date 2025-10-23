@@ -3,6 +3,7 @@ import torch.nn as nn
 from ultralytics import YOLO
 from ultralytics.nn.modules.head import Detect
 import torch.nn.functional as F
+from types import SimpleNamespace
 
 # --- Helper Modules ---
 class ConvBlock(nn.Module):
@@ -144,22 +145,60 @@ class TemporalUNet(nn.Module):
         
         return (self.out_p3(d3), self.out_p4(d2), self.out_p5(d1)), new_hidden
 
-
 class YOLOTemporalUNet(nn.Module):
     """
     Main model combining YOLO feature extraction with temporal U-Net processing.
     Suitable for video object detection or tracking tasks.
     """
     def __init__(self, num_classes=80, yolo_model_name='yolo11m.pt', 
-                 use_conv_lstm=True):
+                 use_conv_lstm=True, hyp: dict = {'box': 7.5, 'cls': 0.5, 'dfl': 1.5}):
         super(YOLOTemporalUNet, self).__init__()
+
         
+        """ Model takes input image of dimension (B, C, H, W) and outputs detections at 3 scales.
+            Eg: (2, 3, 480, 640) -> [ (2, 144, 64, 80), (2, 144, 64, 80), (2, 144, 16, 85) ]
+            why 144? There is a probability distribution over each class(80) and over reg-max(16) bins for each bbox side.
+            So, total channels = 80 + 4*16 = 144
+            (64,80) , (64,80) , (16,80) are the spatial dimensions at 3 scales for input (480,640)            
+            The output is xyxy format bounding boxes first then class scores.
+
+            box: box loss gain
+            This gain controls the importance of the bounding box regression loss.
+            The underlying loss is CIoU (Complete Intersection over Union).
+
+            cls: cls loss gain 
+            This gain controls the importance of the classification loss.
+            The underlying loss is Binary Cross-Entropy (BCE) with Logits.
+
+            dfl: dfl loss gain 
+            This gain controls the importance of the Distribution Focal Loss (DFL) for bounding box regression.
+            DFL helps in refining the bounding box predictions by modeling the distribution of bounding box offsets.
+        """
+
+        self.args = SimpleNamespace(**hyp)
+        self.nc = num_classes
+
         self.feature_extractor = YOLOFeatureExtractor(model_name=yolo_model_name, freeze=True)
         feature_channels = self.feature_extractor.get_feature_channels()
         self.temporal_unet = TemporalUNet(feature_channels=feature_channels, 
                                          use_conv_lstm=use_conv_lstm)
 
-        self.detection_head = Detect(nc=num_classes, ch=feature_channels)
+        self.detection_head = Detect(nc=num_classes,
+                                     ch=feature_channels)
+        # --- START: ADD THIS FIX ---
+        # The v8DetectionLoss function requires the head to know its strides
+        # and reg_max. We must set them manually.
+        # We assume the 3 YOLO features correspond to P3, P4, P5 (strides 8, 16, 32)
+        strides = torch.tensor([8.0, 16.0, 32.0])
+        
+        # Set the attributes directly on the detection head module
+        self.detection_head.stride = strides
+        self.detection_head.reg_max = self.args.reg_max # Use reg_max from your config
+        
+        # Register the strides as a buffer to ensure it moves to the correct
+        # device (e.g., when you call .to(device))
+        self.register_buffer("strides", strides, persistent=False)
+        # --- END: ADD THIS FIX ---
         self.model = nn.ModuleList([self.detection_head])
 
     def forward(self, x, hidden_state=None):
@@ -177,3 +216,11 @@ class YOLOTemporalUNet(nn.Module):
         detections = self.detection_head(list(temporal_features))
 
         return detections, new_hidden
+    
+if __name__ == "__main__":
+    # Simple test to verify model instantiation and forward pass
+    model = YOLOTemporalUNet(num_classes=80, yolo_model_name='yolo11m.pt', use_conv_lstm=True)
+    dummy_input = torch.randn(2, 3, 480, 640)  # Batch of 2 images
+    outputs, _ = model(dummy_input)
+    for i, out in enumerate(outputs):
+        print(f"Output scale {i}: shape {out.shape}")
