@@ -45,7 +45,7 @@ def custom_collate_fn(batch):
 # -----------------------------------------------------
 
 
-def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_length, scheduler=None):
+def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_length, scheduler=None, writer=None, epoch=0):
     # When you call loss.backward(), it will pinpoint the exact line of code in your forward pass that created a "bad" value (like a NaN or inf) that is causing the backward pass to fail.
     # torch.autograd.set_detect_anomaly(True)
     
@@ -53,6 +53,7 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_leng
     total_loss = 0.0
     total_loss_components = torch.zeros(3).to(device)
     pbar = tqdm(dataloader, desc="Training")
+    
     
     for batch_idx, (image_tensor, labels_tensor) in enumerate(pbar):
         image_tensor = image_tensor.to(device)
@@ -70,11 +71,6 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_leng
                 'bboxes': labels_tensor[:, 2:]
             }
         
-        # print(batch_dict['cls'])
-        # print(batch_dict['batch_idx'])
-        # print(batch_dict['bboxes'])
-        # exit(0)
-        # print(preds, batch_dict)
         loss_components, loss_components_detached = loss_fn(preds, batch_dict)   
         scalar_loss = loss_components.sum()
         scalar_loss.backward()
@@ -86,11 +82,22 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_leng
         total_loss_components += loss_components_detached
         pbar.set_postfix(loss=f'{scalar_loss.item():.4f}')
 
+        global_step = epoch * len(dataloader) + batch_idx
+            
+        # Log scalar loss
+        writer.add_scalar('Loss/train_batch', scalar_loss.item(), global_step)
+        writer.add_scalars('Train_Loss_Components_Batch', {
+            'box_loss_batch': loss_components_detached[0].item(),
+            'cls_loss_batch': loss_components_detached[1].item(),
+            'dfl_loss_batch': loss_components_detached[2].item()
+        }, global_step)
+        writer.add_scalar('LearningRate/batch', optimizer.param_groups[0]['lr'], global_step)
+
     avg_loss = total_loss / len(dataloader)
     avg_loss_comps = total_loss_components / len(dataloader)
     return avg_loss, avg_loss_comps
 
-def validate_one_epoch(model, dataloader, loss_fn, device, sequence_length):
+def validate_one_epoch(model, dataloader, loss_fn, device, sequence_length, writer=None, epoch=0):
     model.eval()
     total_loss = 0.0
     total_loss_components = torch.zeros(3).to(device)
@@ -117,6 +124,14 @@ def validate_one_epoch(model, dataloader, loss_fn, device, sequence_length):
             total_loss_components += loss_components_detached             
                  
             pbar.set_postfix(loss=f'{scalar_loss.item():.4f}')
+
+            global_step = epoch * len(dataloader) + batch_idx
+            writer.add_scalar('Loss/val_batch', scalar_loss.item(), global_step)            
+            writer.add_scalars('Val_Loss_Components_Batch', {
+                'box_loss_batch': loss_components_detached[0].item(),
+                'cls_loss_batch': loss_components_detached[1].item(),
+                'dfl_loss_batch': loss_components_detached[2].item()
+            }, global_step)
 
     avg_loss = total_loss / len(dataloader)
     avg_loss_comps = total_loss_components / len(dataloader)
@@ -159,7 +174,9 @@ def train_loop(model, train_loader, val_loader, config, device, save_dir):
             loss_fn, 
             device, 
             config['dataset']['train']['seq_len'],
-            scheduler=scheduler
+            scheduler=scheduler,
+            writer=writer,
+            epoch=epoch
         )
         print(f"Average Training Loss: {train_loss}")
         
@@ -169,14 +186,21 @@ def train_loop(model, train_loader, val_loader, config, device, save_dir):
             val_loader, 
             loss_fn, 
             device, 
-            config['dataset']['train']['seq_len']
+            config['dataset']['train']['seq_len'],
+            writer=writer,
+            epoch=epoch
         )
         print(f"Average Validation Loss: {val_loss}")
         
         # --- Save Checkpoints ---
         # Save the latest model
         latest_checkpoint_path = save_dir / "latest.pt"
-        torch.save(model.state_dict(), latest_checkpoint_path)
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'best_val_loss': best_val_loss  # Save the best loss *so far*
+        }
+        torch.save(checkpoint, latest_checkpoint_path)
 
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
@@ -199,7 +223,13 @@ def train_loop(model, train_loader, val_loader, config, device, save_dir):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_checkpoint_path = save_dir / "best.pt"
-            torch.save(model.state_dict(), best_checkpoint_path)
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'best_val_loss': best_val_loss
+                # You can also save optimizer_state_dict here if you create it before the loop
+            }
+            torch.save(checkpoint, best_checkpoint_path)
             print(f"New best model saved to {best_checkpoint_path} with validation loss: {best_val_loss:.4f}")
         else:
             print(f"Saved latest model checkpoint to {latest_checkpoint_path}")

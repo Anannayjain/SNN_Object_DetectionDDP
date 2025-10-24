@@ -9,11 +9,11 @@ from collections import defaultdict
 
 from model import YOLOTemporalUNet
 from dataset import DSECDataset
+from visualize import run_visualization
 from train import custom_collate_fn, train_loop
 from weight_initialization import initialize_model
 
-
-def get_train_val_split(config, full_train_dataset, dataset_seq_len):    
+def get_train_val_split(config, full_train_dataset):    
     seq_groups = defaultdict(list)
     for idx, (img_dir, _, _) in enumerate(full_train_dataset.samples):
         seq_groups[str(img_dir)].append(idx)
@@ -26,8 +26,8 @@ def get_train_val_split(config, full_train_dataset, dataset_seq_len):
     val_dataset = Subset(full_train_dataset, val_indices)
     return train_dataset, val_dataset
 
-def apply_debug_mode(config, train_dataset, val_dataset):
-    is_debug = config.get('debug', False)
+def apply_train_debug_mode(config, train_dataset, val_dataset):
+    is_debug = config.get('debug_train', False)
     if not is_debug:
         return train_dataset, val_dataset
 
@@ -44,16 +44,15 @@ def apply_debug_mode(config, train_dataset, val_dataset):
     
     return debug_train_dataset, debug_val_dataset
 
-def train_code():
+def train_code(model, config, device):
     save_dir = Path(config['training']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Dataset and DataLoaders ---
     full_train_dataset = DSECDataset(config, mode="train")
-    dataset_seq_len = config['dataset']['train']['seq_len']
 
-    train_dataset, val_dataset = get_train_val_split(config, full_train_dataset, dataset_seq_len)
-    train_dataset, val_dataset = apply_debug_mode(config, train_dataset, val_dataset)
+    train_dataset, val_dataset = get_train_val_split(config, full_train_dataset)
+    train_dataset, val_dataset = apply_train_debug_mode(config, train_dataset, val_dataset)
 
     train_loader = DataLoader(
         train_dataset,
@@ -76,6 +75,47 @@ def train_code():
 
     train_loop(model, train_loader, val_loader, config, device, save_dir)
 
+def apply_test_debug_mode(config, test_dataset):
+    is_debug = config.get('debug_test', False)
+    if not is_debug:
+        return test_dataset
+
+    print("DEBUG MODE: Using a smaller subset for quick iterations.")
+    num_debug_samples = min(100, len(test_dataset))
+    debug_test_indices = list(range(num_debug_samples))
+    debug_test_dataset = Subset(test_dataset, debug_test_indices)
+    print(f"DEBUG: Truncated to {len(debug_test_dataset)} test samples.")
+
+    return debug_test_dataset
+
+
+def visualize_code(model, config, device):
+    save_dir = Path(config['training']['save_dir'])
+    weights_path = save_dir / "best.pt"
+    
+    # Create output directory
+    output_dir = save_dir / "visualizations"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving visualizations to {output_dir}")
+    
+    checkpoint = torch.load(weights_path, map_location=device)            
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    print(f"Model with val loss {checkpoint.get('best_val_loss', float('inf'))} loaded successfully for visualization.")
+
+    test_dataset = DSECDataset(config, mode="test")
+    test_dataset = apply_test_debug_mode(config, test_dataset)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1, 
+        shuffle=False,
+        num_workers=config['training']['num_workers']
+    )
+
+    print(f"Loaded {len(test_dataset)} test samples.")
+
+    run_visualization(config, model, test_loader, output_dir, device)
+
 if __name__ == "__main__":
     with open("config.yaml", 'r') as f:
             config = yaml.safe_load(f)
@@ -89,11 +129,31 @@ if __name__ == "__main__":
         use_conv_lstm=config['model']['use_conv_lstm'],
         hyp=config['model']['hyp']
     ).to(device)
+    
+    initial_best_loss = float('inf') 
 
-    initialize_model(model)
+    if config['training']["resume_training"]:
+        weights_path = Path(config['training']["weights_path"])
+        if weights_path.exists():
+            print(f"Resuming training: Loading from {weights_path}")
+            checkpoint = torch.load(weights_path, map_location=device)            
+            model.load_state_dict(checkpoint['model_state_dict'])
+            initial_best_loss = checkpoint.get('best_val_loss', float('inf'))             
+            print(f"Successfully loaded model and found previous best_val_loss: {initial_best_loss}")
+            
+        else:
+            print(f"WARNING: 'resume_training' is True but weights_path '{weights_path}' not found.")
+            print("Initializing model from scratch...")
+            initialize_model(model)
+    else:
+        # Default behavior: initialize new model
+        print("Initializing new model from scratch...")
+        initialize_model(model)
     
     if(config["mode"] == "train"):
-        train_code()
+        train_code(model, config, device)
+    elif(config["mode"] == "visualize"): 
+        visualize_code(model, config, device)
     elif(config["mode"] == "test"):
         pass  # Testing code to be implemented
         

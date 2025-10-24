@@ -151,7 +151,7 @@ class YOLOTemporalUNet(nn.Module):
     Suitable for video object detection or tracking tasks.
     """
     def __init__(self, num_classes=80, yolo_model_name='yolo11m.pt', 
-                 use_conv_lstm=True, hyp: dict = {'box': 7.5, 'cls': 0.5, 'dfl': 1.5}):
+                 use_conv_lstm=True, hyp: dict = {'box': 7.5, 'cls': 0.5, 'dfl': 1.5, 'reg_max': 16}):
         super(YOLOTemporalUNet, self).__init__()
 
         
@@ -185,20 +185,13 @@ class YOLOTemporalUNet(nn.Module):
 
         self.detection_head = Detect(nc=num_classes,
                                      ch=feature_channels)
-        # --- START: ADD THIS FIX ---
-        # The v8DetectionLoss function requires the head to know its strides
-        # and reg_max. We must set them manually.
         # We assume the 3 YOLO features correspond to P3, P4, P5 (strides 8, 16, 32)
         strides = torch.tensor([8.0, 16.0, 32.0])
-        
-        # Set the attributes directly on the detection head module
+
         self.detection_head.stride = strides
-        self.detection_head.reg_max = self.args.reg_max # Use reg_max from your config
-        
-        # Register the strides as a buffer to ensure it moves to the correct
-        # device (e.g., when you call .to(device))
+        self.detection_head.reg_max = self.args.reg_max 
+
         self.register_buffer("strides", strides, persistent=False)
-        # --- END: ADD THIS FIX ---
         self.model = nn.ModuleList([self.detection_head])
 
     def forward(self, x, hidden_state=None):
