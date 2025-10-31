@@ -91,6 +91,12 @@ def train_one_epoch(model, dataloader, optimizer, loss_fn, device, sequence_leng
             'cls_loss_batch': loss_components_detached[1].item(),
             'dfl_loss_batch': loss_components_detached[2].item()
         }, global_step)
+        print( {
+            'box_loss_batch': loss_components_detached[0].item(),
+            'cls_loss_batch': loss_components_detached[1].item(),
+            'dfl_loss_batch': loss_components_detached[2].item()
+        })
+        # print(loss_components_detached.item())
         writer.add_scalar('LearningRate/batch', optimizer.param_groups[0]['lr'], global_step)
 
     avg_loss = total_loss / len(dataloader)

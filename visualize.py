@@ -38,7 +38,7 @@ def draw_bboxes(image, predictions, class_names, colors):
         label = f"{class_names[cls_idx]} {conf:.2f}"
         color = colors[cls_idx]
         
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(image, (x1, y1-15), (x2, y2-15), color, 2)
         # (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         # cv2.rectangle(image, (x1, y1 - h - 5), (x1 + w, y1), color, -1)        
         # cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)

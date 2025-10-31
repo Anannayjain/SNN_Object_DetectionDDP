@@ -9,8 +9,8 @@ dataset:
     path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test"
     seq_len: 5
 
-mode: "train"  # Options: "train" or "test" or "visualize"
-device: "cuda:2"  # Options: "cuda0", "cuda1", "cuda2", "cuda3" or "cpu"
+mode: "visualize"  # Options: "train" or "test" or "visualize"
+device: "cuda:3"  # Options: "cuda0", "cuda1", "cuda2", "cuda3" or "cpu"
 
 debug_train: False
 debug_test: True
@@ -20,10 +20,10 @@ training:
   epochs: 10
   batch_size: 64      # Adjust based on your GPU memory
   num_workers: 4     # Number of CPU cores for data loading
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.0005
   save_dir: "runs/train/exp1" # Directory to save checkpoints and logs
-  resume_training: False                 # Set to true to load weights
+  resume_training: True                 # Set to true to load weights
   weights_path: "runs/train/exp1/latest.pt" # Path to the .pt file you want to load
 
 model:
@@ -32,6 +32,6 @@ model:
   use_conv_lstm: True # Set to False to use a standard LSTM (not recommended)
   hyp:
     box: 7.5
-    cls: 0.2
+    cls: 1.0
     dfl: 2.5
     reg_max: 16

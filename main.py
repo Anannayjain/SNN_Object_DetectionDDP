@@ -81,7 +81,7 @@ def apply_test_debug_mode(config, test_dataset):
         return test_dataset
 
     print("DEBUG MODE: Using a smaller subset for quick iterations.")
-    num_debug_samples = min(100, len(test_dataset))
+    num_debug_samples = min(600, len(test_dataset))
     debug_test_indices = list(range(num_debug_samples))
     debug_test_dataset = Subset(test_dataset, debug_test_indices)
     print(f"DEBUG: Truncated to {len(debug_test_dataset)} test samples.")
