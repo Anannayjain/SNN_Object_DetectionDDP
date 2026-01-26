@@ -1,280 +1,143 @@
-import numpy as np
-import cv2
-import sys
-from typing import Optional
-from sklearn.metrics import auc
-import time
-from tqdm.notebook import tqdm
-import glob
+import json
 import torch
-import logging
-from ultralytics import YOLO
-import os
-import warnings
-from utils import *
-import gc
-import yaml
+from pathlib import Path
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from tqdm import tqdm
 
-# path = "/raid/ee-udayan/uganguly/opticalflow/data/DSEC/train_images/interlaken_00_c/images/left/rectified"
-# path = "/raid/ee-udayan/uganguly/opticalflow/data/DSEC_DET/test/interlaken_00_a"
-# base_path = "/raid/ee-udayan/uganguly/opticalflow/data/DSEC/train_images"
-# Dataset = [x for i in os.listdir(path) ]
-
-# Get all folder names in the base path
-# folder_names = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
-
-# Generate the full paths and store them in Dataset
-# Dataset = [os.path.join(base_path, folder, "images/left/rectified") for folder in folder_names]
-
-# print(Dataset)  # Print to verify the output
-
-
-
-def process_dataset(
-    dataset,
-    model,
-    yolo_model,
-    bb_dataset,
-    method="",
-    compute_stride=None,
-    model_name="flownets",
-    init_stride = 30,
-    save_video=False
-):
+def load_data(json_path, key_name):
     """
-    Processes each item in the dataset, performing object detection, bounding box tracking,
-    and optional video annotation.
+    Generic loader. 
+    key_name: 'predictions' for pred file, 'annotations' for GT file.
     """
-    if compute_stride is None:
-        def compute_stride(prev_iou, curr_iou, current_stride):
-            return current_stride
-            
-    bb_compare = {}
-    store_time = {}
-    result_frames = []
-    optical_flow = []
-    optical_flow_frame = []
-    model_name = model_name
-    init_stride = init_stride
-    stride_list = [init_stride]
+    with open(json_path, 'r') as f:
+        data_list = json.load(f)
     
-    for video_no,image_path in tqdm(enumerate(dataset), desc="Processing dataset", unit="item", position=0):
-        start_time = time.time()
-        num_frames = 0
-        bboxes_list = []
-        stride = init_stride
-        prev_idx = -stride
-        curr_idx = 0
-        prev_iou = 1
-        curr_iou = 1
-        retrieval_time = 0
-        last_end_time = start_time
-        yolo_count = 0
-        flow_count = 0
-        detections = []
-        prev_image = 0
-        flow_flops = 0
-        tot_flow_flops = 0
-        profiling_time = 0
-        flag = 1
-        track_bbox = []
-        name = os.path.basename(os.path.dirname(os.path.dirname(image_path)))
-        track_bbox = []
-        # track_bbox = np.array([bb_dataset[name][0][0],])
-        # print(track_bbox)
-        # print(type(track_bbox))
-        
-        # Detect objects and track bounding boxes
-        for idx, image in tqdm(enumerate(get_images_from_directory(image_path)), total=len(os.listdir(image_path)), desc="Processing frames", position=1):
-            
-            end_time = time.time()
-            retrieval_time +=end_time-last_end_time
-            if method == "entire_yolo":
-                _, detections = detect_objects(image, model, model_name = yolo_model)
-                track_bbox = detections
-                yolo_count+=1
-                # track_bbox, _ = select_bbox_with_max_iou(track_bbox, detections)
-            
-            elif method == "cropped_yolo":
-                yolo_count+=1
-                if len(track_bbox) == 0:
-                    _, detections = detect_objects(image, model, model_name = yolo_model)
-                    track_bbox = detections
-                else:
-                    _, detections = detect_objects_with_cropping(model, image, track_bbox, model_name = yolo_model)
-                    track_bbox = detections
-                # track_bbox, _ = select_bbox_with_max_iou(track_bbox, detections)
-                
-            elif method == "optical_flow":
-                if(prev_idx + stride == curr_idx):
-                    ## YOLO
-                    yolo_count+=1
-                    prev_idx = curr_idx
-                    _, detections = detect_objects(image, model, model_name = yolo_model)
-                    curr_iou = calc_iou(track_bbox, detections)
-                    track_bbox = detections
-                    # track_bbox, _ = select_bbox_with_max_iou(track_bbox[0], detections)
-                    # track_bbox = np.array([track_bbox,])
-                    stride = compute_stride(prev_iou, curr_iou, stride)
-                    stride_list.append(stride)
-                    prev_iou = curr_iou
-                else:
-                    ## Optical Flow
-                    flow_count+=1
-                    # vel = get_vel(idx)
-                    vel = [[0,0]]
-                    # print(vel)
-                    # model_name=model_name, ckpt_path=ckpt_path, device=device, down_sample=down_sample
-                    # optical_flow, flops, extra_time = get_flow_of_box(track_bbox, prev_image, image, model_name, down_sample = 1)
-                    optical_flow, flops, extra_time = get_optical_flow(prev_image, image, model_name, down_sample = 1)
-                    profiling_time += extra_time
-                    tot_flow_flops += flops
-                    # print(idx)
-                    track_bbox = np.array(update_bounding_boxes(optical_flow, track_bbox, vel))
-            # print(track_bbox)
-            bboxes_list.append(track_bbox[:,:4])
-            
+    # Convert list to dict for fast lookup: { "000150.png": [objects...] }
+    data_dict = {}
+    for item in data_list:
+        data_dict[item['frame_name']] = item.get(key_name, [])
+    return data_dict
 
-            # Optionally annotate and store frames
-            if save_video:
-                frame = annotate_frame(image, track_bbox, color = (255, 0 , 0))
-                frame = annotate_frame(frame, BB_Dataset[list(BB_Dataset.keys())[video_no]][idx] , color = (0, 0 , 255))    
-                # print(frame)        
-                # break   
-                result_frames.append(frame)
-                if len(optical_flow)>0:
-                    optical_flow_frame.append(optical_flow)
+def get_sequence_data(pred_path, gt_path):
+    # 1. Load Data
+    preds_map = load_data(pred_path, key_name="predictions")
+    gt_map = load_data(gt_path, key_name="annotations")
+    
+    metric = MeanAveragePrecision(box_format='xyxy', iou_type='bbox', class_metrics=True)
+    preds_list = []
+    target_list = []
+    
+    # 2. Iterate over all frames in GT
+    all_frames = sorted(gt_map.keys())
+    
+    print(f"Evaluating {len(all_frames)} frames...")
+    
+    for frame_name in tqdm(all_frames):
+        # --- Prepare GT ---
+        gt_objs = gt_map[frame_name]
         
-            prev_image = image
-            num_frames += 1
-            curr_idx+=1
-            last_end_time = time.time()
-
-        end_time = time.time()
-        # retrieval_time = num_frames * 8.25 / 1000
-        yolo_time = (end_time - start_time) - retrieval_time - profiling_time
-        fps_incl = num_frames / (end_time - start_time) if (end_time - start_time) > 0 else 0
-        fps_excl = num_frames / yolo_time if yolo_time > 0 else 0
+        gt_boxes = [obj['bbox'] for obj in gt_objs]
+        gt_labels = [obj['class_id'] for obj in gt_objs]
         
-        yolo_flops = model.info()[3]
-        print(yolo_flops*1e9)
-        if(flow_count):
-            print(tot_flow_flops/flow_count)
-        # print(yolo_count)
-        # print(flow_count)
-        flops = (tot_flow_flops + yolo_count*yolo_flops*1e9) / (flow_count + yolo_count)
-
+        target_dict = {
+            "boxes": torch.tensor(gt_boxes, dtype=torch.float32) if gt_boxes else torch.empty(0, 4),
+            "labels": torch.tensor(gt_labels, dtype=torch.int64) if gt_labels else torch.empty(0, dtype=torch.int64)
+        }
         
-        parts = image_path.split(os.sep)
-        sequence_name = parts[8]
-        bb_compare[sequence_name] = bboxes_list
-        # correct_bbox = np.array(bb_dataset[os.path.basename(os.path.dirname(os.path.dirname(image_path)))], dtype=float)
-        # bb_compare = []
-        correct_bbox = []
-        # Store timing information
-        store_time[os.path.basename(os.path.dirname(os.path.dirname(image_path)))] = {
-            'num_frames': num_frames,
-            'total_time': end_time - start_time,
-            'retrieval_time': retrieval_time,
-            'yolo_time': yolo_time,
-            'fps_including_retrieval': fps_incl,
-            'fps_excluding_retrieval': fps_excl,
-            "flops": flops
+        # --- Prepare Preds ---
+        pred_objs = preds_map.get(frame_name, [])
+        
+        p_boxes = [obj['bbox'] for obj in pred_objs]
+        p_scores = [obj['conf'] for obj in pred_objs]
+        p_labels = [obj['class_id'] for obj in pred_objs]
+        
+        pred_dict = {
+            "boxes": torch.tensor(p_boxes, dtype=torch.float32) if p_boxes else torch.empty(0, 4),
+            "scores": torch.tensor(p_scores, dtype=torch.float32) if p_scores else torch.empty(0),
+            "labels": torch.tensor(p_labels, dtype=torch.int64) if p_labels else torch.empty(0, dtype=torch.int64)
         }
 
-    return {
-        'bb_compare': bb_compare,
-        'store_time': store_time,
-        'frames': result_frames,
-        'stride': np.array(stride_list),
-        'optical_frames' : optical_flow_frame
-    }
+        preds_list.append(pred_dict)
+        target_list.append(target_dict)
 
+    return preds_list, target_list
 
-# result[name] = process_dataset(
-#     Dataset,
-#     model,
-#     yolo_model,
-#     BB_Dataset,
-#     method=method,
-#     compute_stride=compute_stride,
-#     # model_name="flownets",
-#     model_name = "flownets",
-#     # model_name = "no",
-#     init_stride = 30,
-#     save_video=True
-# )
-# print(result[name]["store_time"])
-# print(np.mean(result[name]["stride"]))
-# for i in BB_Dataset.keys():
-#     print(i)
-#     # iou, mAP, iou_list = get_eval_metric_dsec(i, result[name]['bb_compare'][i], BB_Dataset[i])
-#     # print(i, iou, mAP, np.mean(iou_list))
-#     iou, mAP, iou_list = get_eval_metric_dsec("anything", result[name]['bb_compare'][i], BB_Dataset[i])
-#     # for map the order should be pred,true box
-#     #ineed to change here
-#     print(f"iou:{iou}, map:{mAP}, iou_list_mean: {np.mean(iou_list)}")
+DSEC_CLASSES = {
+    0: 'pedestrian', 1: 'rider', 2: 'car', 3: 'bus', 
+    4: 'truck', 5: 'bicycle', 6: 'motorcycle', 7: 'train'
+}
+
+def format_metrics_string(results, title):
+    """Helper to format dictionary results into a readable string."""
+    lines = []
+    lines.append("="*40)
+    lines.append(f"  {title}")
+    lines.append("="*40)
+    lines.append(f"mAP (50-95): {results['map']:.4f}")
+    lines.append(f"mAP (50):    {results['map_50']:.4f}")
+    lines.append(f"mAP (75):    {results['map_75']:.4f}")
+    lines.append("-" * 40)
+    lines.append("Per Class AP:")
     
-# result[name]['frames']
-
-
-
-# save_video = False
-
-# if(save_video):
-#     # Define the output file paths
-#     output_path_main = "main.mp4"
-#     output_path_main_OF = "main_OF.mp4"
-
-#     # Remove existing files if they exist
-#     if os.path.exists(output_path_main):
-#         os.remove(output_path_main)
-
-#     if os.path.exists(output_path_main_OF):
-#         os.remove(output_path_main_OF)
-
-#     if save_video:
-#         result[name]["frames"] = np.array(result[name]["frames"])
-#         save_rgb_frames_to_video(result[name]["frames"], output_path_main, fps=30)
-
-#         result[name]["optical_frames"] = np.array(result[name]["optical_frames"])
-#         save_rgb_frames_to_video(result[name]["optical_frames"], output_path_main_OF, fps=30)
+    map_per_class = results['map_per_class']
+    for cls_idx, score in enumerate(map_per_class):
+        if score >= 0: 
+            cls_name = DSEC_CLASSES.get(cls_idx, f"Class {cls_idx}")
+            lines.append(f"  {cls_name:<12}: {score:.4f}")
+            
+    lines.append("\n")
+    return "\n".join(lines)
 
 if __name__ == "__main__":
-    with open("config.yaml", 'r') as f:
-            config = yaml.safe_load(f)
-base_path = config['dataset']['test']['path']
-# Get all folder names in the base path
-folder_names = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+    # --- PATHS ---
+    GT_DIR = Path("ground_truth")
+    PRED_DIR = Path("runs/train/exp1/test_results")
+    OUTPUT_FILE = Path("evaluation_report.txt")
+    
+    # --- METRICS ---
+    global_metric = MeanAveragePrecision(box_format='xyxy', iou_type='bbox', class_metrics=True)
+    local_metric = MeanAveragePrecision(box_format='xyxy', iou_type='bbox', class_metrics=True)
 
-# Generate the full paths and store them in Dataset
-Dataset = [os.path.join(base_path, folder, "images/left/rectified") for folder in folder_names]
-print(Dataset)
-# print("Number of Taken Videos: " ,len(Dataset), "\nTotal Images/Frames in Video: ", len(os.listdir(base_path)))
-BB_Dataset = create_bb_dataset_dsec(Dataset)
-## Config:
-yolo_model = "v11"
-# method = "entire_yolo"
-method = "optical_flow"
-compute_stride = None
+    pred_files = sorted(list(PRED_DIR.glob("*.json")))
+    if not pred_files:
+        print("No prediction files found.")
+        exit()
 
+    print(f"Evaluating {len(pred_files)} sequences. Writing to {OUTPUT_FILE}...")
+    
+    with open(OUTPUT_FILE, 'w') as f_out:        
+        for pred_file in tqdm(pred_files, desc="Evaluating"):
+            seq_name = pred_file.stem
+            gt_file = GT_DIR / f"{seq_name}.json"
+            
+            if not gt_file.exists():
+                msg = f"Skipping {seq_name}: No GT found.\n"
+                print(msg.strip())
+                f_out.write(msg)
+                continue
+                
+            preds_list, target_list = get_sequence_data(pred_file, gt_file)
+            
+            # --- LOCAL EVALUATION (Single Sequence) ---
+            local_metric.update(preds_list, target_list)
+            seq_results = local_metric.compute()
+            
+            report_str = format_metrics_string(seq_results, f"Sequence: {seq_name}")
+            f_out.write(report_str)
+            f_out.flush() # Ensure it writes to disk immediately
+            
+            # Reset local metric for next loop
+            local_metric.reset()
+            
+            # --- GLOBAL EVALUATION (Accumulate) ---
+            global_metric.update(preds_list, target_list)
 
-if yolo_model == "v11":
-    model = import_v11()
-elif yolo_model == "v5":
-    model = import_v5()
-
-# Suppress all FutureWarnings
-warnings.simplefilter("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-
-
-error_x = []
-error_y = []
-result = {}
-
-if compute_stride is None:
-    name = method
-else:
-    name = method + "_dynamic"
+        # 2. Compute Global Results (After loop ends)
+        print("Computing Global Metrics...")
+        global_results = global_metric.compute()
+        
+        global_report_str = format_metrics_string(global_results, "GLOBAL DATASET RESULTS")
+        f_out.write(global_report_str)
+        
+    print(f"\nDone! Report saved to: {OUTPUT_FILE.absolute()}")
+    print(global_report_str) # Print global stats to terminal at the end

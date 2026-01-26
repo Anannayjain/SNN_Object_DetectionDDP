@@ -8,8 +8,11 @@ dataset:
   test:
     path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test"
     seq_len: 5
+  vis:
+    path: "/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test"
+    seq_len: 5
 
-mode: "visualize"  # Options: "train" or "test" or "visualize"
+mode: "test"  # Options: "train" or "test" or "visualize"
 device: "cuda:3"  # Options: "cuda0", "cuda1", "cuda2", "cuda3" or "cpu"
 
 debug_train: False

@@ -49,3 +49,12 @@ events.out.tfevents.*
 *.npy
 *.npz
 *.csv
+
+# Ignore all video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Or ignore the entire video directory
+video/

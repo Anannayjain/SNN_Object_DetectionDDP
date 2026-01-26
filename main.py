@@ -1,4 +1,3 @@
-
 import torch
 from torch.utils.data import DataLoader
 import yaml
@@ -12,6 +11,7 @@ from dataset import DSECDataset
 from visualize import run_visualization
 from train import custom_collate_fn, train_loop
 from weight_initialization import initialize_model
+from test import run_inference
 
 def get_train_val_split(config, full_train_dataset):    
     seq_groups = defaultdict(list)
@@ -81,7 +81,8 @@ def apply_test_debug_mode(config, test_dataset):
         return test_dataset
 
     print("DEBUG MODE: Using a smaller subset for quick iterations.")
-    num_debug_samples = min(600, len(test_dataset))
+    # num_debug_samples = min(4000, len(test_dataset))
+    num_debug_samples = len(test_dataset)
     debug_test_indices = list(range(num_debug_samples))
     debug_test_dataset = Subset(test_dataset, debug_test_indices)
     print(f"DEBUG: Truncated to {len(debug_test_dataset)} test samples.")
@@ -103,8 +104,35 @@ def visualize_code(model, config, device):
     model.eval()
     print(f"Model with val loss {checkpoint.get('best_val_loss', float('inf'))} loaded successfully for visualization.")
 
+    vis_dataset = DSECDataset(config, mode="vis")
+    vis_dataset = apply_test_debug_mode(config, vis_dataset)
+    vis_loader = DataLoader(
+        vis_dataset,
+        batch_size=1, 
+        shuffle=False,
+        num_workers=config['training']['num_workers']
+    )
+
+    print(f"Loaded {len(vis_dataset)} test samples.")
+
+    run_visualization(config, model, vis_loader, output_dir, device)
+
+def test_code(model, config, device):
+    save_dir = Path(config['training']['save_dir'])
+    weights_path = save_dir / "best.pt"
+    
+    # Create output directory
+    output_dir = save_dir / "test_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving visualizations to {output_dir}")
+    
+    checkpoint = torch.load(weights_path, map_location=device)            
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    print(f"Model with val loss {checkpoint.get('best_val_loss', float('inf'))} loaded successfully for visualization.")
+
     test_dataset = DSECDataset(config, mode="test")
-    test_dataset = apply_test_debug_mode(config, test_dataset)
+    # test_dataset = apply_test_debug_mode(config, test_dataset)
     test_loader = DataLoader(
         test_dataset,
         batch_size=1, 
@@ -114,7 +142,7 @@ def visualize_code(model, config, device):
 
     print(f"Loaded {len(test_dataset)} test samples.")
 
-    run_visualization(config, model, test_loader, output_dir, device)
+    run_inference(config, model, test_loader, output_dir, device)
 
 if __name__ == "__main__":
     with open("config.yaml", 'r') as f:
@@ -155,5 +183,6 @@ if __name__ == "__main__":
     elif(config["mode"] == "visualize"): 
         visualize_code(model, config, device)
     elif(config["mode"] == "test"):
+        test_code(model, config, device)
         pass  # Testing code to be implemented
         
