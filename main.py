@@ -6,12 +6,19 @@ from torch.utils.data import Subset
 from sklearn.model_selection import train_test_split
 from collections import defaultdict
 
-from model import YOLOTemporalUNet
-from dataset import DSECDataset
-from visualize import run_visualization
-from train import custom_collate_fn, train_loop
+# --------- Additional Imports --------------
+from ultralytics import YOLO
+from ultralytics.utils import ops
+from tqdm import tqdm
+from PIL import Image
+import json
+
+from Models.lstm_model import YOLOTemporalUNet
+from Dataset.lstm_dataset import DSECDataset
+from Train.lstm_train import custom_collate_fn, train_loop
 from weight_initialization import initialize_model
-from test import run_inference
+from Test.lstm_test import run_inference
+from Test.vanilla_test import run_vanilla_test
 
 def get_train_val_split(config, full_train_dataset):    
     seq_groups = defaultdict(list)
@@ -89,34 +96,6 @@ def apply_test_debug_mode(config, test_dataset):
 
     return debug_test_dataset
 
-
-def visualize_code(model, config, device):
-    save_dir = Path(config['training']['save_dir'])
-    weights_path = save_dir / "best.pt"
-    
-    # Create output directory
-    output_dir = save_dir / "visualizations"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Saving visualizations to {output_dir}")
-    
-    checkpoint = torch.load(weights_path, map_location=device)            
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    print(f"Model with val loss {checkpoint.get('best_val_loss', float('inf'))} loaded successfully for visualization.")
-
-    vis_dataset = DSECDataset(config, mode="vis")
-    vis_dataset = apply_test_debug_mode(config, vis_dataset)
-    vis_loader = DataLoader(
-        vis_dataset,
-        batch_size=1, 
-        shuffle=False,
-        num_workers=config['training']['num_workers']
-    )
-
-    print(f"Loaded {len(vis_dataset)} test samples.")
-
-    run_visualization(config, model, vis_loader, output_dir, device)
-
 def test_code(model, config, device):
     save_dir = Path(config['training']['save_dir'])
     weights_path = save_dir / "best.pt"
@@ -149,40 +128,50 @@ if __name__ == "__main__":
             config = yaml.safe_load(f)
 
     device = config["device"]
+    model_type = config['model'].get('type', 'lstm') # Default to lstm
 
-    # --- Model Initialization ---
-    model = YOLOTemporalUNet(
-        num_classes=config['model']['num_classes'],
-        yolo_model_name=config['model']['yolo_model_name'],
-        use_conv_lstm=config['model']['use_conv_lstm'],
-        hyp=config['model']['hyp']
-    ).to(device)
-    
-    initial_best_loss = float('inf') 
-
-    if config['training']["resume_training"]:
-        weights_path = Path(config['training']["weights_path"])
-        if weights_path.exists():
-            print(f"Resuming training: Loading from {weights_path}")
-            checkpoint = torch.load(weights_path, map_location=device)            
-            model.load_state_dict(checkpoint['model_state_dict'])
-            initial_best_loss = checkpoint.get('best_val_loss', float('inf'))             
-            print(f"Successfully loaded model and found previous best_val_loss: {initial_best_loss}")
-            
+    print(f"--- Running Mode: {config['mode']} | Model Type: {model_type} ---")
+    if model_type == "vanilla":
+        if config["mode"] == "test":
+            # Direct hand-off to the separate script
+            # No model initialization needed here, run_vanilla_test handles it
+            run_vanilla_test(config, device)
         else:
-            print(f"WARNING: 'resume_training' is True but weights_path '{weights_path}' not found.")
-            print("Initializing model from scratch...")
+            print("Error: Vanilla model type is only supported in 'test' mode via this script.")
+    elif model_type == "lstm":
+        # --- Model Initialization ---
+        model = YOLOTemporalUNet(
+            num_classes=config['model']['num_classes'],
+            yolo_model_name=config['model']['yolo_model_name'],
+            use_conv_lstm=config['model']['use_conv_lstm'],
+            hyp=config['model']['hyp']
+        ).to(device)
+
+        initial_best_loss = float('inf') 
+
+        if config['training']["resume_training"]:
+            weights_path = Path(config['training']["weights_path"])
+            if weights_path.exists():
+                print(f"Resuming training: Loading from {weights_path}")
+                checkpoint = torch.load(weights_path, map_location=device)            
+                model.load_state_dict(checkpoint['model_state_dict'])
+                initial_best_loss = checkpoint.get('best_val_loss', float('inf'))             
+                print(f"Successfully loaded model and found previous best_val_loss: {initial_best_loss}")
+                
+            else:
+                print(f"WARNING: 'resume_training' is True but weights_path '{weights_path}' not found.")
+                print("Initializing model from scratch...")
+                initialize_model(model)
+        else:
+            # Default behavior: initialize new model
+            print("Initializing new model from scratch...")
             initialize_model(model)
+     
+        if(config["mode"] == "train"):
+            train_code(model, config, device)
+        elif(config["mode"] == "test"):
+            test_code(model, config, device)
     else:
-        # Default behavior: initialize new model
-        print("Initializing new model from scratch...")
-        initialize_model(model)
-    
-    if(config["mode"] == "train"):
-        train_code(model, config, device)
-    elif(config["mode"] == "visualize"): 
-        visualize_code(model, config, device)
-    elif(config["mode"] == "test"):
-        test_code(model, config, device)
-        pass  # Testing code to be implemented
+        print(f"Error: Unknown model type '{model_type}'. Use 'lstm' or 'vanilla'.")
+        exit(0)
         

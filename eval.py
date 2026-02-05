@@ -28,8 +28,7 @@ def get_sequence_data(pred_path, gt_path):
     target_list = []
     
     # 2. Iterate over all frames in GT
-    all_frames = sorted(gt_map.keys())
-    
+    all_frames = sorted(gt_map.keys())  
     print(f"Evaluating {len(all_frames)} frames...")
     
     for frame_name in tqdm(all_frames):
@@ -91,7 +90,7 @@ def format_metrics_string(results, title):
 if __name__ == "__main__":
     # --- PATHS ---
     GT_DIR = Path("ground_truth")
-    PRED_DIR = Path("runs/train/exp1/test_results")
+    PRED_DIR = Path("runs/train/exp1/test_results_vanilla")
     OUTPUT_FILE = Path("evaluation_report.txt")
     
     # --- METRICS ---

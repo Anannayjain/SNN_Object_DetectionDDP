@@ -6,9 +6,9 @@ from tqdm import tqdm
 from types import SimpleNamespace # To create a fake 'args' object
 
 # --- Import from your project files ---
-from model import YOLOTemporalUNet
-from dataset import DSECDataset
-from train import custom_collate_fn
+from yolo_temporal.Models.lstm_model import YOLOTemporalUNet
+from yolo_temporal.Dataset.lstm_dataset import DSECDataset
+from yolo_temporal.Train.lstm_train import custom_collate_fn
 from main import get_train_val_split # Assuming main.py contains this
 
 # --- Import from Ultralytics ---

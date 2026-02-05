@@ -5,16 +5,44 @@ import numpy as np
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
+import json
 
 # --- Import from your project files ---
-from model import YOLOTemporalUNet
-from dataset import DSECDataset 
+# from Models.lstm_model import YOLOTemporalUNet
+from Dataset.lstm_dataset import DSECDataset 
 
 # --- Import from Ultralytics ---
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils import ops
 
 import matplotlib.pyplot as plt
+
+# --- CONFIGURATION ---
+DSEC_CLASSES = {
+    0: 'pedestrian', 1: 'rider', 2: 'car', 3: 'bus', 
+    4: 'truck', 5: 'bicycle', 6: 'motorcycle', 7: 'train'
+}
+
+def get_colors(num_classes=8):
+    """Generate distinct colors for visualization."""
+    cmap = plt.get_cmap('tab20')
+    return [tuple(int(c * 255) for c in cmap(i)[:3]) for i in range(num_classes)]
+
+def load_json_data(json_path, key_name):
+    """
+    Loads JSON and converts to Dict: { "000150.png": [objects...] }
+    """
+    if not Path(json_path).exists():
+        print(f"Warning: File not found {json_path}")
+        return {}
+        
+    with open(json_path, 'r') as f:
+        data_list = json.load(f)
+    
+    data_dict = {}
+    for item in data_list:
+        data_dict[item['frame_name']] = item.get(key_name, [])
+    return data_dict
 
 def draw_bboxes(image, predictions, scaled_gt, class_names, colors):
     """
@@ -33,7 +61,7 @@ def draw_bboxes(image, predictions, scaled_gt, class_names, colors):
     GT_COLOR = (0, 255, 0)
     if scaled_gt is not None and len(scaled_gt) > 0:
         for box in scaled_gt:
-            x1, y1, x2, y2, cls_idx = box.cpu().numpy()
+            x1, y1, x2, y2, cls_idx = box
             x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
             cls_idx = int(cls_idx)
             
@@ -51,108 +79,82 @@ def draw_bboxes(image, predictions, scaled_gt, class_names, colors):
             #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     if predictions is not None and len(predictions) > 0:
         for pred in predictions:
-            x1, y1, x2, y2, conf, cls_idx = pred.cpu().numpy()
+            x1, y1, x2, y2, conf, cls_idx = pred
             x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
             cls_idx = int(cls_idx)
             
             # label = f"{class_names[cls_idx]} {conf:.2f}"
             color = colors[cls_idx]
             
-            cv2.rectangle(image, (x1, y1-15), (x2, y2-15), color, 2)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
             # (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             # cv2.rectangle(image, (x1, y1 - h - 5), (x1 + w, y1), color, -1)        
             # cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
     return image
 
-def run_visualization(config, model, vis_loader, output_dir, device, conf_thres=0.3): # Using 0.3 from your __main__
-    """
-    Runs inference on the vis set and saves visualized outputs.
-    """
-    sequence_length = config['dataset']['vis']['seq_len']
+def visualize_sequence(seq_name, image_dir, pred_path, gt_path, output_dir):
+    seq_out_dir = Path(output_dir) / seq_name
+    seq_out_dir.mkdir(parents=True, exist_ok=True)
+
+    preds_map = load_json_data(pred_path, key_name="predictions")
+    gt_map = load_json_data(gt_path, key_name="annotations")
     
-    # --- Setup Class Names and Colors ---
-    cmap = plt.get_cmap('tab20')
+    all_frames = sorted(set(list(preds_map.keys()) + list(gt_map.keys())))
+    
+    if not all_frames:
+        print(f"Skipping {seq_name}: No frames in JSONs.")
+        return
 
-    # Generate the list of RGB tuples (scaled to 0-255)
-    num_classes = config['model']['num_classes']
-    colors = [tuple(int(c * 255) for c in cmap(i)[:3]) for i in range(num_classes)]
-    class_names = [f"Class_{i}" for i in range(config['model']['num_classes'])]
-
-    # --- Run Inference and Visualization Loop ---
-    pbar = tqdm(vis_loader, desc="Visualizing")
-    for batch_idx, (image_tensor, last_frame_path_tuple, labels_tensor) in enumerate(pbar):
+    colors = get_colors()
+    
+    # Using tqdm leave=False to keep the main progress bar clean
+    for frame_name in tqdm(all_frames, desc=f"Rendering {seq_name}", leave=False):
+        img_path = Path(image_dir) / frame_name
         
-        last_frame_path = last_frame_path_tuple[0]
-        image_tensor = image_tensor.to(device)
-        
-        # --- Manual Model Forward ---
-        hidden_state = None
-        with torch.no_grad():
-            for t in range(sequence_length):
-                frame = image_tensor[:, t, :, :, :]
-                # preds is a tuple: (concatenated_output, [feature_map_1, ...])
-                preds, hidden_state = model(frame, hidden_state)
-
-        preds_post = non_max_suppression(
-            preds[0],
-            conf_thres=conf_thres,
-            iou_thres=0.45,
-            multi_label=True # Set multi_label=True for standard NMS
-        )
-        # Get predictions for the single image in the batch
-        # shape (N, 6) -> [x1, y1, x2, y2, conf, cls]
-        preds_for_image = preds_post[0] 
-
-        # --- Load Original Image for Drawing ---
-        original_image = cv2.imread(last_frame_path)
-        if original_image is None:
-            print(f"Warning: Could not read image {last_frame_path}. Skipping.")
+        if not img_path.exists():
             continue
-            
-        # Only required if model input size differs from original size of image
-        orig_h, orig_w = original_image.shape[:2]
-        model_h, model_w = image_tensor.shape[-2:]
 
-        if preds_for_image is not None and len(preds_for_image) > 0:
-            scaled_preds_boxes = ops.scale_boxes(
-                (model_h, model_w), 
-                preds_for_image[:, :4], 
-                (orig_h, orig_w)
-            )
-            scaled_preds = torch.cat((scaled_preds_boxes, preds_for_image[:, 4:]), dim=1)
-        else:
-            scaled_preds = None
+        image = cv2.imread(str(img_path))
+        if image is None: continue
 
-        labels_tensor = labels_tensor[0]
-        if labels_tensor is not None and len(labels_tensor) > 0:
-            # labels_tensor is [class, cx, cy, w, h]            
-            gt_boxes = labels_tensor.clone()
-
-            gt_boxes[:, 1] *= orig_w  # cx
-            gt_boxes[:, 2] *= orig_h  # cy
-            gt_boxes[:, 3] *= orig_w  # w
-            gt_boxes[:, 4] *= orig_h  # h
-            
-            x1 = gt_boxes[:, 1] - gt_boxes[:, 3] / 2
-            y1 = gt_boxes[:, 2] - gt_boxes[:, 4] / 2
-            x2 = gt_boxes[:, 1] + gt_boxes[:, 3] / 2
-            y2 = gt_boxes[:, 2] + gt_boxes[:, 4] / 2
-            
-            scaled_gt = torch.stack([x1, y1, x2, y2, gt_boxes[:, 0]], dim=1)
-
-        image_with_boxes = draw_bboxes(original_image, scaled_preds, scaled_gt, class_names, colors)    
-
-        path_obj = Path(last_frame_path)
-        sequence_name = path_obj.parents[3].name
-        seq_output_dir = output_dir / sequence_name
-        seq_output_dir.mkdir(parents=True, exist_ok=True)        
-        save_path = seq_output_dir / path_obj.name
+        # GT Format: [x1, y1, x2, y2, cls]
+        gt_objs = gt_map.get(frame_name, [])
+        gt_list = [obj['bbox'] + [obj['class_id']] for obj in gt_objs]
         
-        cv2.imwrite(str(save_path), image_with_boxes)
+        # Pred Format: [x1, y1, x2, y2, conf, cls]
+        pred_objs = preds_map.get(frame_name, [])
+        pred_list = [obj['bbox'] + [obj['conf'], obj['class_id']] for obj in pred_objs]
 
-    print(f"\nVisualization complete. Results saved to {output_dir}")
+        image = draw_bboxes(image, pred_list, gt_list, DSEC_CLASSES, colors)
+        cv2.imwrite(str(seq_out_dir / frame_name), image)
 
 if __name__ == "__main__":
+    # --- GLOBAL PATHS ---
+    BASE_DSEC_DIR = Path("/home/ashutosh/pulkit/SNN_scratch_AJ/dsec_dataset/test")
+    PRED_DIR = Path("runs/train/exp1/test_results") # Where your model outputs are
+    GT_DIR = Path("ground_truth")             # Where your GT jsons are
+    
+    OUTPUT_DIR = Path("runs/train/exp1/visualizations")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    pred_files = sorted(list(PRED_DIR.glob("*.json")))
+    print(f"Found {len(pred_files)} sequences to visualize.")
+
+    for pred_file in tqdm(pred_files, desc="Total Progress"):
+        seq_name = pred_file.stem  # e.g., "zurich_city_11_a"
+        
+        raw_image_dir = BASE_DSEC_DIR / seq_name / "images/left/distorted"
+        gt_file = GT_DIR / f"{seq_name}.json"
+        
+        if not raw_image_dir.exists():
+            print(f"Warning: Image folder not found for {seq_name}. Skipping.")
+            continue
+            
+        # Run Visualization
+        visualize_sequence(seq_name, raw_image_dir, pred_file, gt_file, OUTPUT_DIR)
+
+    print(f"\nAll Done! Visualizations saved to: {OUTPUT_DIR.absolute()}")
+
+def run_visualization():
     pass
-    # run_visualization(config_path="config.yaml", conf_thres=0.3)

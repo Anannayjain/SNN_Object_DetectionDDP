@@ -86,11 +86,22 @@ def run_inference(config, model, test_loader, output_dir, device, conf_thres=0.0
                 # Round to 2 decimals to save disk space
                 boxes_list = final_preds.cpu().numpy()
                 
+                
                 for box in boxes_list:
+                    x1, y1, x2, y2 = [float(x) for x in box[:4]]
+
+                    # Subtract 15 from y coordinates
+                    bbox = [
+                        round(x1, 2), 
+                        round(y1 - 15, 2), 
+                        round(x2, 2), 
+                        round(y2 - 15, 2)
+                    ]
+                    
                     boxes_to_save.append({
                         "class_id": int(box[5]),
                         "conf": round(float(box[4]), 4),
-                        "bbox": [round(float(x), 2) for x in box[:4]] # [x1, y1, x2, y2]
+                        "bbox": bbox # [x1, y1, x2, y2]
                     })
 
             # --- Store in Buffer ---

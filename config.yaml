@@ -30,6 +30,7 @@ training:
   weights_path: "runs/train/exp1/latest.pt" # Path to the .pt file you want to load
 
 model:
+  type: "vanilla" # or lstm or optical flow
   num_classes: 8      # Number of object classes
   yolo_model_name: 'yolo11m.pt'  # Pre-trained YOLO model to use as a backbone
   use_conv_lstm: True # Set to False to use a standard LSTM (not recommended)

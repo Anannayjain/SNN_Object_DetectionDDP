@@ -8,8 +8,8 @@ from collections import defaultdict
 from torch.utils.data import DataLoader
 
 # --- Imports from your project ---
-from dataset import DSECDataset
-from train import custom_collate_fn 
+from yolo_temporal.Dataset.lstm_dataset import DSECDataset
+from yolo_temporal.Train.lstm_train import custom_collate_fn 
 
 # --- Imports from Ultralytics ---
 from ultralytics.utils.nms import non_max_suppression

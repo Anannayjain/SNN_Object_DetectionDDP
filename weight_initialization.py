@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from model import ConvLSTM2d
+from Models.lstm_model import ConvLSTM2d
 # --- ADDED THIS IMPORT ---
 from ultralytics.nn.modules.head import Detect 
 
